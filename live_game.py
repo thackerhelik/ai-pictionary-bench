@@ -20,24 +20,22 @@ WORD_BANK = [
     "banana", "sun", "flower", "bottle", "glasses", "scissors"
 ]
 
-active_connections: list[WebSocket] = []
+# Player Registry: { ws: {"id": str, "name": str, "score": int, "solved": bool} }
+connected_players: dict[WebSocket, dict] = {}
 
-# Persistent Game State across rounds
 game_state = {
     "word": "",
     "drawer": DEFAULT_DRAWER,
     "is_running": False,
+    "can_guess": False,
     "round_num": 0,
-    "human_score": 0,
     "ai_score": 0,
-    "human_guessed": False,
-    "ai_guessed": False,
+    "ai_solved": False,
     "revealed_indices": set(),
     "time_left": 60
 }
 
 def levenshtein_distance(s1: str, s2: str) -> int:
-    """Calculates edit distance between two strings without external dependencies."""
     if len(s1) < len(s2):
         return levenshtein_distance(s2, s1)
     if len(s2) == 0:
@@ -61,38 +59,74 @@ def is_close_guess(guess: str, target: str) -> bool:
         return True
     return False
 
+def calculate_score(time_left: int, hints_revealed_count: int) -> int:
+    score = (time_left * 10) - (hints_revealed_count * 100)
+    return max(50, score)
+
+def get_leaderboard_payload():
+    roster = []
+    for p in connected_players.values():
+        roster.append({
+            "name": p["name"],
+            "score": p["score"],
+            "solved": p["solved"],
+            "is_ai": False
+        })
+    roster.append({
+        "name": f"🤖 AI ({GUESSER_MODEL})",
+        "score": game_state["ai_score"],
+        "solved": game_state["ai_solved"],
+        "is_ai": True
+    })
+    roster.sort(key=lambda x: x["score"], reverse=True)
+    return roster
+
+async def broadcast(message: dict):
+    for ws in list(connected_players.keys()):
+        try:
+            await ws.send_json(message)
+        except Exception:
+            pass
+
 HTML_UI = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>AI Pictionary - Live Arena</title>
+    <title>AI Pictionary Arena</title>
     <link rel="icon" href="data:,">
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; margin: 0; height: 100vh; background: #0b0f19; color: #f8fafc; }
+        
+        /* Nickname Overlay */
+        #name-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 100; backdrop-filter: blur(4px); }
+        .modal-box { background: #111827; border: 1px solid #1e293b; border-radius: 12px; padding: 24px; width: 320px; text-align: center; }
+        .modal-box input { width: 90%; padding: 10px; margin: 15px 0; border-radius: 6px; border: 1px solid #334155; background: #0b0f19; color: #fff; font-size: 15px; text-align: center; }
+
         #canvas-panel { flex: 2; display: flex; flex-direction: column; align-items: center; justify-content: center; border-right: 1px solid #1e293b; padding: 20px; }
         #chat-panel { flex: 1; display: flex; flex-direction: column; background: #070a10; }
         
-        /* Scoreboard */
-        #scoreboard { width: 360px; background: #111827; border: 1px solid #1e293b; border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
-        .score-box { display: flex; flex-direction: column; align-items: center; font-size: 13px; font-weight: 600; }
-        .score-val { font-size: 17px; font-weight: 800; color: #38bdf8; }
-        .status-badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; margin-top: 2px; }
-        .badge-waiting { background: #374151; color: #9ca3af; }
-        .badge-solved { background: #15803d; color: #86efac; font-weight: bold; }
-
-        /* Timer and Blanks */
-        #game-header { width: 360px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 6px; }
+        /* Header & Leaderboard */
+        #game-header { width: 380px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 6px; }
         .status-row { display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 15px; }
         #timer-display { font-variant-numeric: tabular-nums; font-size: 18px; color: #38bdf8; }
         #word-blanks { font-family: monospace; font-size: 22px; letter-spacing: 5px; color: #fbbf24; font-weight: bold; }
         #progress-container { width: 100%; height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; }
         #progress-bar { width: 100%; height: 100%; background: #38bdf8; transition: width 1s linear, background-color 0.5s; }
 
-        #canvas-container { background: #ffffff; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); overflow: hidden; width: 360px; height: 360px; display: flex; align-items: center; justify-content: center; }
+        /* Dynamic Ranked Table */
+        #leaderboard-card { width: 380px; background: #111827; border: 1px solid #1e293b; border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+        .lb-header { background: #1e293b; padding: 6px 12px; font-size: 12px; font-weight: 700; color: #94a3b8; display: flex; justify-content: space-between; }
+        .lb-list { display: flex; flex-direction: column; max-height: 110px; overflow-y: auto; }
+        .lb-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; border-bottom: 1px solid #1e293b; font-size: 13px; }
+        .lb-name { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+        .badge-solved { color: #86efac; font-size: 12px; font-weight: bold; }
+
+        #canvas-container { background: #ffffff; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); overflow: hidden; width: 380px; height: 380px; display: flex; align-items: center; justify-content: center; }
         #messages { flex: 1; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 8px; font-size: 14px; }
         .msg { padding: 8px 12px; border-radius: 6px; max-width: 85%; }
         .human { background: #2563eb; align-self: flex-end; }
+        .peer { background: #1e293b; border: 1px solid #334155; align-self: flex-start; }
         .ai { background: #1e293b; border: 1px solid #334155; align-self: flex-start; }
         .ai-warn { background: #2d2218; border: 1px solid #78350f; color: #fbbf24; align-self: flex-start; font-size: 12px; }
         .system { color: #94a3b8; font-style: italic; align-self: center; font-size: 13px; }
@@ -103,9 +137,9 @@ HTML_UI = """
         
         #input-box { display: flex; padding: 12px; border-top: 1px solid #1e293b; background: #070a10; }
         #guess-input { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid #334155; background: #111827; color: #fff; font-size: 14px; outline: none; }
-        #guess-input:disabled { background: #1f2937; color: #6b7280; cursor: not-allowed; }
+        #guess-input:disabled { background: #182030; color: #64748b; cursor: not-allowed; }
         
-        #controls { margin-top: 15px; display: flex; flex-direction: column; gap: 10px; align-items: center; width: 360px; }
+        #controls { margin-top: 15px; display: flex; flex-direction: column; gap: 10px; align-items: center; width: 380px; }
         .control-row { display: flex; gap: 8px; width: 100%; justify-content: center; align-items: center; }
         select, input[type="text"] { padding: 8px 10px; border-radius: 6px; border: 1px solid #334155; background: #111827; color: #fff; font-size: 13px; }
         button { padding: 8px 14px; border-radius: 6px; border: none; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; transition: background 0.15s; }
@@ -115,22 +149,22 @@ HTML_UI = """
     </style>
 </head>
 <body>
+    <div id="name-modal">
+        <div class="modal-box">
+            <h2>Join AI Pictionary</h2>
+            <p style="color: #94a3b8; font-size: 13px;">Choose a display name for the scoreboard</p>
+            <input type="text" id="player-name-input" placeholder="Your name (e.g. Alex)" maxlength="16" onkeydown="if(event.key==='Enter') joinGame()"/>
+            <button class="action-btn" style="width: 95%;" onclick="joinGame()">Enter Arena</button>
+        </div>
+    </div>
+
     <div id="canvas-panel">
-        <div id="scoreboard">
-            <div class="score-box">
-                <span style="color: #94a3b8;">Round</span>
-                <span class="score-val" id="round-counter">0</span>
+        <div id="leaderboard-card">
+            <div class="lb-header">
+                <span>RANKED LEADERBOARD</span>
+                <span id="round-tag">ROUND 0</span>
             </div>
-            <div class="score-box">
-                <span>👤 Human</span>
-                <span class="score-val" id="human-score">0</span>
-                <span id="human-badge" class="status-badge badge-waiting">Waiting</span>
-            </div>
-            <div class="score-box">
-                <span>🤖 AI</span>
-                <span class="score-val" id="ai-score">0</span>
-                <span id="ai-badge" class="status-badge badge-waiting">Waiting</span>
-            </div>
+            <div class="lb-list" id="lb-rows"></div>
         </div>
 
         <div id="game-header">
@@ -144,7 +178,7 @@ HTML_UI = """
         </div>
 
         <div id="canvas-container">
-            <svg id="live-svg" viewBox="0 0 300 300" width="360" height="360" xmlns="http://www.w3.org/2000/svg">
+            <svg id="live-svg" viewBox="0 0 300 300" width="380" height="380" xmlns="http://www.w3.org/2000/svg">
                 <style>
                     * { stroke-linecap: round; stroke-linejoin: round; }
                     rect.canvas-bg { fill: #ffffff !important; stroke: none !important; }
@@ -172,29 +206,105 @@ HTML_UI = """
     <div id="chat-panel">
         <div id="messages"></div>
         <div id="input-box">
-            <input type="text" id="guess-input" placeholder="Type your guess here..." onkeydown="if(event.key==='Enter') sendGuess()"/>
+            <input type="text" id="guess-input" disabled placeholder="Waiting for round to begin..." onkeydown="if(event.key==='Enter') sendGuess()"/>
         </div>
     </div>
 
     <script>
-        const ws = new WebSocket(`ws://${location.host}/ws`);
+        let ws = null;
+        let myName = "";
         const svgContainer = document.getElementById("live-svg");
         const messages = document.getElementById("messages");
         const timerDisplay = document.getElementById("timer-display");
         const progressBar = document.getElementById("progress-bar");
         const wordBlanks = document.getElementById("word-blanks");
         const guessInput = document.getElementById("guess-input");
-
-        const humanScoreEl = document.getElementById("human-score");
-        const aiScoreEl = document.getElementById("ai-score");
-        const humanBadge = document.getElementById("human-badge");
-        const aiBadge = document.getElementById("ai-badge");
-        const roundCounter = document.getElementById("round-counter");
+        const lbRows = document.getElementById("lb-rows");
+        const roundTag = document.getElementById("round-tag");
 
         const svgFrame = `<style>
             * { stroke-linecap: round; stroke-linejoin: round; }
             rect.canvas-bg { fill: #ffffff !important; stroke: none !important; }
         </style><rect class="canvas-bg" width="300" height="300"/>`;
+
+        function joinGame() {
+            const val = document.getElementById("player-name-input").value.trim();
+            if (!val) return;
+            myName = val;
+            document.getElementById("name-modal").style.display = "none";
+            initWebSocket();
+        }
+
+        function initWebSocket() {
+            const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+            ws.onopen = () => {
+                ws.send(JSON.stringify({ type: "register", name: myName }));
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.type === "stroke_update") {
+                    svgContainer.innerHTML = svgFrame + data.svg;
+                } else if (data.type === "chat") {
+                    addMessage(data.text, data.sender);
+                } else if (data.type === "prep_round") {
+                    wordBlanks.innerText = data.blanks;
+                    svgContainer.innerHTML = svgFrame;
+                    messages.innerHTML = '';
+                    roundTag.innerText = `ROUND ${data.round}`;
+                    guessInput.disabled = true;
+                    guessInput.placeholder = "🎨 Drawer is planning sketch... Guessing locked!";
+                    addMessage(`Round ${data.round} started! Target is ${data.length} letters.`, 'system');
+                } else if (data.type === "round_active") {
+                    guessInput.disabled = false;
+                    guessInput.placeholder = "Type your guess here...";
+                    guessInput.focus();
+                } else if (data.type === "timer_tick") {
+                    timerDisplay.innerText = `⏳ ${data.time_left}s`;
+                    const pct = (data.time_left / 60) * 100;
+                    progressBar.style.width = pct + "%";
+                    if (pct > 50) progressBar.style.backgroundColor = "#38bdf8";
+                    else if (pct > 25) progressBar.style.backgroundColor = "#fbbf24";
+                    else progressBar.style.backgroundColor = "#ef4444";
+                } else if (data.type === "hint_update") {
+                    wordBlanks.innerText = data.blanks;
+                    addMessage(`Hint revealed: ${data.blanks}`, 'hint');
+                } else if (data.type === "lock_input") {
+                    guessInput.disabled = true;
+                    guessInput.placeholder = "You solved it! Waiting for round to finish...";
+                } else if (data.type === "leaderboard") {
+                    renderLeaderboard(data.roster);
+                } else if (data.type === "round_end") {
+                    wordBlanks.innerText = data.revealed_word.toUpperCase();
+                    timerDisplay.innerText = "⏳ 0s";
+                    progressBar.style.width = "0%";
+                    guessInput.disabled = true;
+                    addMessage(`Round over! The secret word was '${data.revealed_word}'.`, 'round-end-banner');
+                }
+            };
+        }
+
+        function renderLeaderboard(roster) {
+            lbRows.innerHTML = "";
+            const medals = ["🥇", "🥈", "🥉"];
+            roster.forEach((p, idx) => {
+                const row = document.createElement("div");
+                row.className = "lb-row";
+                const rankPrefix = medals[idx] || `${idx + 1}.`;
+                row.innerHTML = `
+                    <div class="lb-name">
+                        <span>${rankPrefix}</span>
+                        <span>${p.name} ${p.name === myName ? '(You)' : ''}</span>
+                        ${p.solved ? '<span class="badge-solved">✓</span>' : ''}
+                    </div>
+                    <span style="font-weight: 700; color: #38bdf8;">${p.score} pts</span>
+                `;
+                lbRows.appendChild(row);
+            });
+        }
 
         function addMessage(text, type) {
             const div = document.createElement("div");
@@ -203,57 +313,6 @@ HTML_UI = """
             messages.appendChild(div);
             messages.scrollTop = messages.scrollHeight;
         }
-
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            if (data.type === "stroke_update") {
-                svgContainer.innerHTML = svgFrame + data.svg;
-            } else if (data.type === "chat") {
-                addMessage(data.text, data.sender);
-            } else if (data.type === "round_start") {
-                wordBlanks.innerText = data.blanks;
-                svgContainer.innerHTML = svgFrame;
-                messages.innerHTML = '';
-                roundCounter.innerText = data.round;
-                humanBadge.className = "status-badge badge-waiting";
-                humanBadge.innerText = "Waiting";
-                aiBadge.className = "status-badge badge-waiting";
-                aiBadge.innerText = "Waiting";
-                guessInput.disabled = false;
-                guessInput.placeholder = "Type your guess here...";
-                guessInput.focus();
-                addMessage(`--- Round ${data.round} Started! Guess the ${data.length}-letter object. ---`, 'system');
-            } else if (data.type === "timer_tick") {
-                timerDisplay.innerText = `⏳ ${data.time_left}s`;
-                const pct = (data.time_left / 60) * 100;
-                progressBar.style.width = pct + "%";
-                if (pct > 50) progressBar.style.backgroundColor = "#38bdf8";
-                else if (pct > 25) progressBar.style.backgroundColor = "#fbbf24";
-                else progressBar.style.backgroundColor = "#ef4444";
-            } else if (data.type === "hint_update") {
-                wordBlanks.innerText = data.blanks;
-                addMessage(`Hint revealed: ${data.blanks}`, 'hint');
-            } else if (data.type === "player_solved") {
-                if (data.player === "human") {
-                    humanBadge.className = "status-badge badge-solved";
-                    humanBadge.innerText = "Solved ✓";
-                    guessInput.disabled = true;
-                    guessInput.placeholder = "You guessed the word! Waiting for round to finish...";
-                } else if (data.player === "ai") {
-                    aiBadge.className = "status-badge badge-solved";
-                    aiBadge.innerText = "Solved ✓";
-                }
-            } else if (data.type === "score_update") {
-                humanScoreEl.innerText = data.human_score;
-                aiScoreEl.innerText = data.ai_score;
-            } else if (data.type === "round_end") {
-                wordBlanks.innerText = data.revealed_word.toUpperCase();
-                timerDisplay.innerText = "⏳ 0s";
-                progressBar.style.width = "0%";
-                guessInput.disabled = true;
-                addMessage(`Round finished! The secret word was '${data.revealed_word}'.`, 'round-end-banner');
-            }
-        };
 
         function sendGuess() {
             if (guessInput.value.trim() && !guessInput.disabled) {
@@ -288,61 +347,71 @@ def get_ui():
 async def favicon():
     return Response(status_code=204)
 
-async def broadcast(message: dict):
-    for conn in active_connections:
-        await conn.send_json(message)
-
-def calculate_score(time_left: int, hints_revealed_count: int) -> int:
-    score = (time_left * 10) - (hints_revealed_count * 100)
-    return max(50, score)
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    active_connections.append(websocket)
+    connected_players[websocket] = {"name": "Guest", "score": 0, "solved": False}
     try:
         while True:
             data = await websocket.receive_json()
-            if data["type"] == "guess" and game_state["is_running"]:
-                guess = data["text"].strip().lower()
-                target = game_state["word"].lower()
+            event_type = data.get("type")
 
-                if game_state["human_guessed"]:
+            if event_type == "register":
+                raw_name = data.get("name", "Player").strip()
+                connected_players[websocket]["name"] = raw_name[:16] if raw_name else "Player"
+                await broadcast({"type": "leaderboard", "roster": get_leaderboard_payload()})
+
+            elif event_type == "guess":
+                # Strict input gating: drop all guesses before strokes start
+                if not game_state["is_running"] or not game_state["can_guess"]:
                     continue
 
-                if guess == target:
-                    game_state["human_guessed"] = True
-                    pts = calculate_score(game_state["time_left"], len(game_state["revealed_indices"]))
-                    game_state["human_score"] += pts
+                player = connected_players.get(websocket)
+                if not player or player["solved"]:
+                    continue
 
+                guess = data.get("text", "").strip().lower()
+                target = game_state["word"].lower()
+
+                if guess == target:
+                    player["solved"] = True
+                    pts = calculate_score(game_state["time_left"], len(game_state["revealed_indices"]))
+                    player["score"] += pts
+
+                    await websocket.send_json({"type": "lock_input"})
                     await broadcast({
                         "type": "chat",
                         "sender": "win-line",
-                        "text": f"🎉 You guessed the word! (+{pts} pts)"
+                        "text": f"🎉 {player['name']} guessed the word! (+{pts} pts)"
                     })
-                    await broadcast({"type": "player_solved", "player": "human"})
-                    await broadcast({
-                        "type": "score_update",
-                        "human_score": game_state["human_score"],
-                        "ai_score": game_state["ai_score"]
-                    })
+                    await broadcast({"type": "leaderboard", "roster": get_leaderboard_payload()})
 
-                    if game_state["ai_guessed"]:
+                    # If all players (human + AI) have finished, complete the round immediately
+                    all_humans_done = all(p["solved"] for p in connected_players.values())
+                    if all_humans_done and game_state["ai_solved"]:
                         game_state["is_running"] = False
                 elif is_close_guess(guess, target):
-                    await broadcast({
+                    await websocket.send_json({
                         "type": "chat",
                         "sender": "close",
                         "text": f"'{guess}' is very close!"
                     })
                 else:
-                    await broadcast({"type": "chat", "sender": "human", "text": f"You guessed: {guess}"})
+                    # Echo guess publicly with the player's name
+                    for client_ws, info in connected_players.items():
+                        sender_class = "human" if client_ws == websocket else "peer"
+                        await client_ws.send_json({
+                            "type": "chat",
+                            "sender": sender_class,
+                            "text": f"{player['name']}: {guess}"
+                        })
 
     except WebSocketDisconnect:
-        active_connections.remove(websocket)
+        if websocket in connected_players:
+            del connected_players[websocket]
+            await broadcast({"type": "leaderboard", "roster": get_leaderboard_payload()})
 
 def sanitize_and_parse_strokes(raw_svg: str) -> list[str]:
-    """Extracts SVG shapes while preserving intentional color fills and default wireframes."""
     svg_block = re.search(r"<svg[\s\S]*?<\/svg>", raw_svg, re.IGNORECASE)
     content = svg_block.group(0) if svg_block else raw_svg
 
@@ -353,18 +422,14 @@ def sanitize_and_parse_strokes(raw_svg: str) -> list[str]:
     for s in matches:
         if 'width="300"' in s and 'height="300"' in s:
             continue
-        
-        # Ensure tag closes cleanly
         if not s.endswith("/>") and not re.search(r"<\/\w+>$", s):
             s = s.rstrip(">") + "/>"
 
-        # 1. Fill handling: Allow color fills, but convert missing/black fills to none
         if "fill=" not in s.lower():
             s = s.replace("/>", ' fill="none"/>', 1)
         else:
             s = re.sub(r'fill=["\']?(black|#000000|#000|#111111)["\']?', 'fill="none"', s, flags=re.IGNORECASE)
 
-        # 2. Stroke handling: If stroke is missing, default to neutral dark slate
         if "stroke=" not in s.lower():
             s = s.replace("/>", ' stroke="#334155" stroke-width="4"/>', 1)
         elif "stroke-width=" not in s.lower():
@@ -404,45 +469,41 @@ async def start_game_round(word: str = None, random_pick: bool = False, drawer: 
 async def run_game_loop(secret_word: str, drawer_model: str):
     game_state["word"] = secret_word
     game_state["is_running"] = True
+    game_state["can_guess"] = False
     game_state["round_num"] += 1
-    game_state["human_guessed"] = False
-    game_state["ai_guessed"] = False
+    game_state["ai_solved"] = False
     game_state["revealed_indices"] = set()
     game_state["time_left"] = 60
 
-    attempted_ai_guesses = set()
+    for p in connected_players.values():
+        p["solved"] = False
 
+    attempted_ai_guesses = set()
     blanks = build_hint_pattern(secret_word, game_state["revealed_indices"])
+
+    # 1. Lock input and broadcast preparation state
     await broadcast({
-        "type": "round_start",
+        "type": "prep_round",
         "round": game_state["round_num"],
         "length": len(secret_word),
         "blanks": blanks
     })
+    await broadcast({"type": "leaderboard", "roster": get_leaderboard_payload()})
     await broadcast({"type": "chat", "sender": "system", "text": f"[{drawer_model}] is sketching..."})
 
-    # Generalized drawing prompt with semantic coloring and higher stroke budget
-    prompt = f"""You are playing Pictionary. Draw a clear, detailed, multi-element vector sketch of: '{secret_word}'.
+    prompt = f"""You are playing Pictionary. Draw a highly detailed, progressive vector sketch of: '{secret_word}'.
 Canvas: 300x300. Center is (150, 150).
 
-FEW-SHOT EXAMPLE:
-<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">
-  <rect x="110" y="140" width="80" height="20" rx="4" fill="#d97706" stroke="#92400e" stroke-width="4"/>
-  <rect x="115" y="165" width="10" height="60" fill="#92400e" stroke="#78350f" stroke-width="3"/>
-  <rect x="175" y="165" width="10" height="60" fill="#92400e" stroke="#78350f" stroke-width="3"/>
-  <rect x="115" y="70" width="10" height="70" fill="#b45309" stroke="#78350f" stroke-width="3"/>
-  <rect x="125" y="80" width="60" height="15" fill="#fef3c7" stroke="#92400e" stroke-width="3"/>
-</svg>
+DRAW IN 3 CHRONOLOGICAL PHASES (Output 12 to 16 total shapes):
+- Phase 1 (Base & Foundation): Main silhouette, ground, or primary outline.
+- Phase 2 (Surfaces & Colors): Main body volume, fills, branches, cushions, or rims.
+- Phase 3 (Fine Details & Context): Spines/needles, wheels, buttons, texture lines, or background cues.
 
 RULES FOR '{secret_word}':
-1. THEMATIC COLORING: Pick a cohesive, natural color palette fitting '{secret_word}' (e.g. browns/wood tones for furniture, green/brown for plants, warm reds/yellows for food/sun, dark metallics for tools/vehicles).
-2. COLOR FILL TOOL: Use BOTH outline strokes (stroke="...") and colored fills (fill="...") to give shapes real volume and color.
-3. EXTENDED DETAIL (8 to 14 shapes): Draw the complete object piece-by-piece:
-   - Primary structure & surfaces (seats, cushions, frames, bodies)
-   - Supporting elements (all legs, wheels, handles, struts)
-   - Defining accents (slats, textures, details)
-4. Do NOT stop after 2 or 3 strokes. Output 8 to 14 distinct elements.
-5. Return ONLY the raw <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">...</svg> block."""
+1. Output 12 to 16 distinct geometric elements (<rect>, <circle>, <ellipse>, <path>, <line>).
+2. Choose realistic colors matching '{secret_word}'. Use fill="..." for solid parts and stroke="..." for outlines.
+3. Every shape must have stroke-width="3" or "4".
+4. Return ONLY the raw <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">...</svg> block. No text."""
 
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
@@ -455,17 +516,11 @@ RULES FOR '{secret_word}':
 
     msg = response.get('message', {})
     svg_content = msg.get('content', '').strip()
-    
     if not svg_content and 'thinking' in msg:
         svg_content = msg['thinking'].strip()
 
-    print(f"\n==========================================")
-    print(f"[DEBUG Drawer Raw ({drawer_model}) for '{secret_word}']:")
-    print(svg_content if svg_content else f"<EMPTY> | Done: {response.get('done_reason')} | Count: {response.get('eval_count')}")
-    print(f"==========================================")
-
     strokes = sanitize_and_parse_strokes(svg_content)
-    print(f"[DEBUG Drawer Parsed]: Extracted {len(strokes)} valid strokes from {drawer_model}\n")
+    num_strokes = len(strokes)
 
     if not strokes:
         await broadcast({"type": "round_end", "revealed_word": secret_word})
@@ -473,17 +528,27 @@ RULES FOR '{secret_word}':
         game_state["is_running"] = False
         return
 
-    # Master 60-Second Loop
+    # Timeline calculation: 46s window for strokes
+    DRAWING_WINDOW = 46.0
+    stroke_schedule = [int(i * (DRAWING_WINDOW / num_strokes)) for i in range(num_strokes)]
+
     total_time = 60
     current_svg_body = ""
     stroke_idx = 0
-    num_strokes = len(strokes)
     strokes_finished_announced = False
+
+    # 2. Emit the first stroke and unlock guessing simultaneously
+    current_svg_body += f"\n{strokes[0]}"
+    stroke_idx = 1
+    await broadcast({"type": "stroke_update", "svg": current_svg_body})
+    game_state["can_guess"] = True
+    await broadcast({"type": "round_active"})
 
     for second_left in range(total_time, 0, -1):
         if not game_state["is_running"]:
             break
 
+        elapsed = total_time - second_left
         game_state["time_left"] = second_left
         await broadcast({"type": "timer_tick", "time_left": second_left})
 
@@ -499,8 +564,8 @@ RULES FOR '{secret_word}':
                 game_state["revealed_indices"].add(random.choice(avail))
                 await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
 
-        # Progressive stroke reveals (reveals 1 stroke every 2 seconds)
-        if stroke_idx < num_strokes and (total_time - second_left) % 2 == 0:
+        # Timeline emission
+        while stroke_idx < num_strokes and elapsed >= stroke_schedule[stroke_idx]:
             current_svg_body += f"\n{strokes[stroke_idx]}"
             await broadcast({"type": "stroke_update", "svg": current_svg_body})
             stroke_idx += 1
@@ -509,7 +574,7 @@ RULES FOR '{secret_word}':
                 await broadcast({"type": "chat", "sender": "system", "text": "🎨 Sketch complete! Keep guessing until time runs out!"})
 
         # Guesser attempts prediction every 4 seconds
-        if not game_state["ai_guessed"] and (total_time - second_left) % 4 == 0 and current_svg_body:
+        if not game_state["ai_solved"] and elapsed % 4 == 0 and current_svg_body:
             full_svg = f"""<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">
                 <style>
                     * {{ stroke-linecap: round; stroke-linejoin: round; }}
@@ -542,11 +607,10 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
             )
             raw_guess = ai_resp['message']['content']
             ai_guess = re.sub(r"[^\w]", "", raw_guess).strip().lower()
-            print(f"[DEBUG Guesser Raw] '{ai_guess}' for target '{secret_word}' with pattern '{current_pattern}'")
 
             if matches_pattern(ai_guess, secret_word, game_state["revealed_indices"]):
                 if ai_guess == secret_word.lower():
-                    game_state["ai_guessed"] = True
+                    game_state["ai_solved"] = True
                     pts = calculate_score(second_left, len(game_state["revealed_indices"]))
                     game_state["ai_score"] += pts
 
@@ -555,14 +619,10 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
                         "sender": "win-line",
                         "text": f"🤖 [{GUESSER_MODEL}] guessed the word! (+{pts} pts)"
                     })
-                    await broadcast({"type": "player_solved", "player": "ai"})
-                    await broadcast({
-                        "type": "score_update",
-                        "human_score": game_state["human_score"],
-                        "ai_score": game_state["ai_score"]
-                    })
+                    await broadcast({"type": "leaderboard", "roster": get_leaderboard_payload()})
 
-                    if game_state["human_guessed"]:
+                    all_humans_done = all(p["solved"] for p in connected_players.values())
+                    if all_humans_done:
                         game_state["is_running"] = False
                 else:
                     if ai_guess not in attempted_ai_guesses:
@@ -575,8 +635,9 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
 
         await asyncio.sleep(1.0)
 
-    # Round wrap-up
+    # 3. Round wrap-up
     game_state["is_running"] = False
+    game_state["can_guess"] = False
     await broadcast({"type": "round_end", "revealed_word": secret_word})
 
 if __name__ == "__main__":
