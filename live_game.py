@@ -13,14 +13,14 @@ app = FastAPI()
 DEFAULT_DRAWER = "gemma4:e4b"
 GUESSER_MODEL = "qwen2.5vl:3b"
 
-# Palette applied automatically if model defaults to black
-COLOR_PALETTE = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#06b6d4", "#ec4899"]
+COLOR_PALETTE = ["#3b82f6", "#ef4444", "#10b981", "#f59e0b", "#8b5cf6", "#06b6d4"]
 
+# Game dictionary
 WORD_BANK = [
     "apple", "clock", "house", "car", "guitar", "bicycle", "airplane",
     "candle", "cactus", "chair", "umbrella", "bridge", "robot", "spider",
     "tree", "ladder", "camera", "boat", "cloud", "pizza", "sword", "snowman",
-    "banana", "sun", "flower"
+    "banana", "sun", "flower", "bottle", "glasses", "scissors"
 ]
 
 active_connections: list[WebSocket] = []
@@ -54,6 +54,7 @@ HTML_UI = """
         .msg { padding: 8px 12px; border-radius: 6px; max-width: 85%; }
         .human { background: #2563eb; align-self: flex-end; }
         .ai { background: #1e293b; border: 1px solid #334155; align-self: flex-start; }
+        .ai-warn { background: #2d2218; border: 1px solid #78350f; color: #fbbf24; align-self: flex-start; font-size: 12px; }
         .system { color: #94a3b8; font-style: italic; align-self: center; font-size: 13px; }
         .hint { color: #fbbf24; font-weight: 600; align-self: center; font-size: 13px; }
         .win { background: #16a34a; font-weight: bold; align-self: center; text-align: center; }
@@ -226,8 +227,6 @@ def parse_and_colorize_strokes(raw_svg: str) -> list[str]:
     for idx, s in enumerate(matches):
         if 'width="300"' in s and 'height="300"' in s:
             continue
-        
-        # Enforce vibrant colors: if the model omitted stroke or set black/gray, assign from palette
         chosen_color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
         if "stroke=" not in s.lower():
             s = s.replace(">", f' stroke="{chosen_color}">', 1)
@@ -247,6 +246,13 @@ def matches_pattern(guess: str, word: str, revealed_indices: set[int]) -> bool:
         if guess[idx] != word[idx]:
             return False
     return True
+
+def get_candidate_words(word: str, revealed_indices: set[int]) -> list[str]:
+    candidates = [w for w in WORD_BANK if matches_pattern(w, word, revealed_indices)]
+    if word not in candidates:
+        candidates.append(word)
+    random.shuffle(candidates)
+    return candidates[:8]
 
 @app.get("/start")
 async def start_game_round(word: str = None, random_pick: bool = False, drawer: str = DEFAULT_DRAWER):
@@ -268,30 +274,29 @@ async def run_game_loop(secret_word: str, drawer_model: str):
     await broadcast({"type": "round_start", "length": len(secret_word), "blanks": blanks})
     await broadcast({"type": "chat", "sender": "system", "text": f"[{drawer_model}] is sketching..."})
 
-    # Drawer prompt with multi-color few-shot
-    prompt = f"""You are playing Pictionary. Draw a clear, detailed, multi-colored outline sketch of: '{secret_word}'.
-Canvas: 300x300, center at (150, 150).
+    # Drawer prompt with explicit horizontal vs vertical spatial layout rules
+    prompt = f"""You are playing Pictionary. Draw a clear, recognizable SVG outline sketch of: '{secret_word}'.
+Canvas: 300x300. Center is (150, 150).
 
-FEW-SHOT EXAMPLE:
-<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">
-  <circle cx="150" cy="150" r="60" stroke="#ef4444" stroke-width="4" fill="none"/>
-  <path d="M 150 90 Q 155 60 165 50" stroke="#78350f" stroke-width="4" fill="none"/>
-  <path d="M 160 65 Q 185 60 190 75 Q 175 85 160 65" stroke="#10b981" stroke-width="4" fill="none"/>
-</svg>
+SPATIAL ORIENTATION RULES:
+- For HORIZONTAL or VEHICLE objects (bicycle, car, airplane, boat, glasses):
+  Spread components left-to-right along the X-axis!
+  For 'bicycle': draw left wheel at cx="80" cy="200" r="45", right wheel at cx="220" cy="200" r="45", and connect them with frame lines between (80, 200) and (220, 200). DO NOT stack wheels on top of each other!
+- For VERTICAL objects (tree, candle, snowman, sword):
+  Stack components along the Y-axis.
 
-RULES FOR '{secret_word}':
-1. Output 6 to 10 distinct geometric shapes (path, rect, circle, line).
-2. Canvas scale: central structure 80-140px wide/tall centered at (150, 150).
-3. Use bright stroke colors (e.g. stroke="#3b82f6", stroke="#ef4444", stroke="#10b981", stroke="#f59e0b").
-4. Every element MUST have fill="none" and stroke-width="4".
-5. Return ONLY raw SVG inside <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">...</svg>. No text."""
+GENERAL RULES:
+1. Output 5 to 9 distinct geometric shapes (circle, path, rect, line).
+2. Use bright stroke colors (e.g. stroke="#3b82f6", stroke="#ef4444", stroke="#10b981").
+3. Every shape MUST have fill="none" and stroke-width="4".
+4. Return ONLY raw SVG inside <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">...</svg>. No explanations."""
 
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
         None, lambda: ollama.chat(
             model=drawer_model,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.25}
+            options={"temperature": 0.2}
         )
     )
 
@@ -329,7 +334,7 @@ RULES FOR '{secret_word}':
                 revealed_indices.add(random.choice(avail))
                 await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, revealed_indices)})
 
-        # Progressively add strokes
+        # Progressive stroke drawing
         if stroke_idx < num_strokes and (total_time - second_left) % 3 == 0:
             current_svg_body += f"\n{strokes[stroke_idx]}"
             await broadcast({"type": "stroke_update", "svg": current_svg_body})
@@ -352,26 +357,30 @@ RULES FOR '{secret_word}':
             png_bytes = cairosvg.svg2png(bytestring=full_svg.encode("utf-8"), output_width=300, output_height=300)
             current_pattern = build_hint_pattern(secret_word, revealed_indices)
 
-            wrong_guesses_str = ", ".join(sorted(list(attempted_ai_guesses))) if attempted_ai_guesses else "none"
-
-            guess_prompt = f"""Identify the object sketched in this image.
-CONSTRAINTS:
-- Pattern: {current_pattern}
-- Word length: Exactly {len(secret_word)} letters
-- INCORRECT GUESSES ALREADY TRIED: [{wrong_guesses_str}]. DO NOT repeat these.
-Answer with ONLY the single lowercase noun matching the pattern."""
+            # Dictionary-assisted candidate list when hints exist
+            if revealed_indices:
+                candidates = get_candidate_words(secret_word, revealed_indices)
+                candidate_str = ", ".join(candidates)
+                guess_prompt = f"""Identify the object sketched in this image.
+HINTS:
+- Pattern: {current_pattern} ({len(secret_word)} letters)
+- Options matching this pattern: [{candidate_str}]
+Choose the SINGLE word from the list that best matches the sketch. Answer with ONLY that single word."""
+            else:
+                guess_prompt = f"What simple object is sketched in this image? The word has {len(secret_word)} letters. Answer with ONLY the single lowercase noun."
 
             ai_resp = await loop.run_in_executor(
                 None, lambda: ollama.chat(
                     model=GUESSER_MODEL,
                     messages=[{"role": "user", "content": guess_prompt, "images": [png_bytes]}],
-                    options={"temperature": 0.3}
+                    options={"temperature": 0.2}
                 )
             )
             raw_guess = ai_resp['message']['content']
             ai_guess = re.sub(r"[^\w]", "", raw_guess).strip().lower()
+            print(f"[DEBUG Guesser Raw] '{ai_guess}' for target '{secret_word}' with pattern '{current_pattern}'")
 
-            # Strict programmatic pattern filter: Discard guesses violating the revealed letters
+            # Validate against pattern
             if matches_pattern(ai_guess, secret_word, revealed_indices):
                 if ai_guess not in attempted_ai_guesses:
                     attempted_ai_guesses.add(ai_guess)
@@ -381,6 +390,11 @@ Answer with ONLY the single lowercase noun matching the pattern."""
                         await broadcast({"type": "round_end", "revealed_word": secret_word})
                         await broadcast({"type": "chat", "sender": "win", "text": f"🤖 AI WON! Correctly identified '{secret_word}'!"})
                         break
+            else:
+                # If it guessed a word violating revealed hints, show it with a warning rather than going silent
+                if ai_guess and ai_guess not in attempted_ai_guesses:
+                    attempted_ai_guesses.add(ai_guess)
+                    await broadcast({"type": "chat", "sender": "ai-warn", "text": f"[{GUESSER_MODEL}] tried: {ai_guess} (violates hint)"})
 
         await asyncio.sleep(1.0)
 
