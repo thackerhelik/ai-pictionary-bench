@@ -20,19 +20,22 @@ WORD_BANK = [
     "banana", "sun", "flower", "bottle", "glasses", "scissors"
 ]
 
-# Player Registry: { ws: {"id": str, "name": str, "score": int, "solved": bool} }
+# Player Registry: { ws: {"name": str, "score": int, "solved": bool} }
 connected_players: dict[WebSocket, dict] = {}
 
 game_state = {
+    "match_running": False,    # True while match is active
+    "is_paused": False,        # True while host has paused the match
+    "is_round_active": False,  # True while an individual round is running
     "word": "",
     "drawer": DEFAULT_DRAWER,
-    "is_running": False,
     "can_guess": False,
     "round_num": 0,
     "ai_score": 0,
     "ai_solved": False,
     "revealed_indices": set(),
-    "time_left": 60
+    "time_left": 60,
+    "current_svg": ""          # Preserved for instant midway join sync
 }
 
 def levenshtein_distance(s1: str, s2: str) -> int:
@@ -98,7 +101,6 @@ HTML_UI = """
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; margin: 0; height: 100vh; background: #0b0f19; color: #f8fafc; }
         
-        /* Nickname Overlay */
         #name-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 100; backdrop-filter: blur(4px); }
         .modal-box { background: #111827; border: 1px solid #1e293b; border-radius: 12px; padding: 24px; width: 320px; text-align: center; }
         .modal-box input { width: 90%; padding: 10px; margin: 15px 0; border-radius: 6px; border: 1px solid #334155; background: #0b0f19; color: #fff; font-size: 15px; text-align: center; }
@@ -106,7 +108,6 @@ HTML_UI = """
         #canvas-panel { flex: 2; display: flex; flex-direction: column; align-items: center; justify-content: center; border-right: 1px solid #1e293b; padding: 20px; }
         #chat-panel { flex: 1; display: flex; flex-direction: column; background: #070a10; }
         
-        /* Header & Leaderboard */
         #game-header { width: 380px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 6px; }
         .status-row { display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 15px; }
         #timer-display { font-variant-numeric: tabular-nums; font-size: 18px; color: #38bdf8; }
@@ -114,7 +115,6 @@ HTML_UI = """
         #progress-container { width: 100%; height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; }
         #progress-bar { width: 100%; height: 100%; background: #38bdf8; transition: width 1s linear, background-color 0.5s; }
 
-        /* Dynamic Ranked Table */
         #leaderboard-card { width: 380px; background: #111827; border: 1px solid #1e293b; border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
         .lb-header { background: #1e293b; padding: 6px 12px; font-size: 12px; font-weight: 700; color: #94a3b8; display: flex; justify-content: space-between; }
         .lb-list { display: flex; flex-direction: column; max-height: 110px; overflow-y: auto; }
@@ -133,28 +133,29 @@ HTML_UI = """
         .hint { color: #fbbf24; font-weight: 600; align-self: center; font-size: 13px; }
         .close { background: #b45309; color: #fef3c7; font-weight: 600; align-self: flex-end; font-size: 13px; }
         .win-line { background: #15803d; color: #ffffff; font-weight: bold; align-self: center; text-align: center; width: 90%; }
-        .round-end-banner { background: #1e1b4b; border: 1px solid #4338ca; color: #c7d2fe; font-weight: 600; align-self: center; text-align: center; width: 90%; }
-        
+        .intermission-line { background: #312e81; border: 1px solid #4f46e5; color: #e0e7ff; font-weight: 600; align-self: center; text-align: center; width: 90%; }
+        .pause-banner { background: #78350f; border: 1px solid #f59e0b; color: #fef3c7; font-weight: 700; align-self: center; text-align: center; width: 90%; }
+
         #input-box { display: flex; padding: 12px; border-top: 1px solid #1e293b; background: #070a10; }
         #guess-input { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid #334155; background: #111827; color: #fff; font-size: 14px; outline: none; }
         #guess-input:disabled { background: #182030; color: #64748b; cursor: not-allowed; }
         
-        #controls { margin-top: 15px; display: flex; flex-direction: column; gap: 10px; align-items: center; width: 380px; }
-        .control-row { display: flex; gap: 8px; width: 100%; justify-content: center; align-items: center; }
-        select, input[type="text"] { padding: 8px 10px; border-radius: 6px; border: 1px solid #334155; background: #111827; color: #fff; font-size: 13px; }
-        button { padding: 8px 14px; border-radius: 6px; border: none; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; transition: background 0.15s; }
-        button:hover { background: #1d4ed8; }
-        button.action-btn { background: #059669; }
-        button.action-btn:hover { background: #047857; }
+        #controls { margin-top: 15px; display: flex; gap: 8px; width: 380px; justify-content: center; align-items: center; }
+        select { padding: 8px 10px; border-radius: 6px; border: 1px solid #334155; background: #111827; color: #fff; font-size: 13px; }
+        button { padding: 8px 14px; border-radius: 6px; border: none; color: #fff; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+        button:hover { opacity: 0.9; }
+        button.start-btn { background: #059669; }
+        button.pause-btn { background: #d97706; }
+        button.stop-btn { background: #dc2626; }
     </style>
 </head>
 <body>
     <div id="name-modal">
         <div class="modal-box">
             <h2>Join AI Pictionary</h2>
-            <p style="color: #94a3b8; font-size: 13px;">Choose a display name for the scoreboard</p>
+            <p style="color: #94a3b8; font-size: 13px;">Choose a nickname for the scoreboard</p>
             <input type="text" id="player-name-input" placeholder="Your name (e.g. Alex)" maxlength="16" onkeydown="if(event.key==='Enter') joinGame()"/>
-            <button class="action-btn" style="width: 95%;" onclick="joinGame()">Enter Arena</button>
+            <button class="start-btn" style="width: 95%;" onclick="joinGame()">Enter Arena</button>
         </div>
     </div>
 
@@ -162,7 +163,7 @@ HTML_UI = """
         <div id="leaderboard-card">
             <div class="lb-header">
                 <span>RANKED LEADERBOARD</span>
-                <span id="round-tag">ROUND 0</span>
+                <span id="round-tag">LOBBY</span>
             </div>
             <div class="lb-list" id="lb-rows"></div>
         </div>
@@ -188,31 +189,31 @@ HTML_UI = """
         </div>
 
         <div id="controls">
-            <div class="control-row">
-                <button class="action-btn" onclick="startRandom()">🎲 Next Random Word</button>
-                <select id="drawer-select">
-                    <option value="gemma4:e4b">Drawer: gemma4:e4b</option>
-                    <option value="qwen3.5:2b">Drawer: qwen3.5:2b</option>
-                    <option value="qwen2.5:3b">Drawer: qwen2.5:3b</option>
-                </select>
-            </div>
-            <div class="control-row">
-                <input type="text" id="custom-word" placeholder="Or test custom word..." style="flex: 1;" />
-                <button onclick="startCustom()">Draw</button>
-            </div>
+            <button id="start-btn" class="start-btn" onclick="startMatch()">▶ Start Game</button>
+            <button id="pause-btn" class="pause-btn" style="display:none;" onclick="togglePause()">⏸ Pause</button>
+            <button id="stop-btn" class="stop-btn" style="display:none;" onclick="stopMatch()">⏹ End Match</button>
+            <select id="drawer-select" onchange="updateDrawer()">
+                <option value="gemma4:e4b">Drawer: gemma4:e4b</option>
+                <option value="qwen3.5:2b">Drawer: qwen3.5:2b</option>
+                <option value="qwen2.5:3b">Drawer: qwen2.5:3b</option>
+            </select>
         </div>
     </div>
 
     <div id="chat-panel">
         <div id="messages"></div>
         <div id="input-box">
-            <input type="text" id="guess-input" disabled placeholder="Waiting for round to begin..." onkeydown="if(event.key==='Enter') sendGuess()"/>
+            <input type="text" id="guess-input" disabled placeholder="Waiting for match to start..." onkeydown="if(event.key==='Enter') sendGuess()"/>
         </div>
     </div>
 
     <script>
         let ws = null;
         let myName = "";
+        let matchRunning = false;
+        let isPaused = false;
+        let hasSolvedCurrentRound = false;
+
         const svgContainer = document.getElementById("live-svg");
         const messages = document.getElementById("messages");
         const timerDisplay = document.getElementById("timer-display");
@@ -221,6 +222,10 @@ HTML_UI = """
         const guessInput = document.getElementById("guess-input");
         const lbRows = document.getElementById("lb-rows");
         const roundTag = document.getElementById("round-tag");
+
+        const startBtn = document.getElementById("start-btn");
+        const pauseBtn = document.getElementById("pause-btn");
+        const stopBtn = document.getElementById("stop-btn");
 
         const svgFrame = `<style>
             * { stroke-linecap: round; stroke-linejoin: round; }
@@ -251,17 +256,29 @@ HTML_UI = """
                 } else if (data.type === "chat") {
                     addMessage(data.text, data.sender);
                 } else if (data.type === "prep_round") {
+                    hasSolvedCurrentRound = false;
                     wordBlanks.innerText = data.blanks;
                     svgContainer.innerHTML = svgFrame;
-                    messages.innerHTML = '';
                     roundTag.innerText = `ROUND ${data.round}`;
                     guessInput.disabled = true;
-                    guessInput.placeholder = "🎨 Drawer is planning sketch... Guessing locked!";
-                    addMessage(`Round ${data.round} started! Target is ${data.length} letters.`, 'system');
+                    guessInput.placeholder = "🎨 Drawer is sketching... Locked!";
+                    addMessage(`--- Round ${data.round} Started! Object has ${data.length} letters. ---`, 'system');
                 } else if (data.type === "round_active") {
-                    guessInput.disabled = false;
-                    guessInput.placeholder = "Type your guess here...";
-                    guessInput.focus();
+                    if (!isPaused && !hasSolvedCurrentRound) {
+                        guessInput.disabled = false;
+                        guessInput.placeholder = "Type your guess here...";
+                        guessInput.focus();
+                    }
+                } else if (data.type === "midway_sync") {
+                    svgContainer.innerHTML = svgFrame + data.svg;
+                    wordBlanks.innerText = data.blanks;
+                    roundTag.innerText = data.is_paused ? "PAUSED" : `ROUND ${data.round}`;
+                    isPaused = data.is_paused;
+                    if (data.can_guess && !isPaused) {
+                        guessInput.disabled = false;
+                        guessInput.placeholder = "Type your guess here...";
+                    }
+                    addMessage(`Joined mid-round! Guessing the ${data.length}-letter object.`, 'system');
                 } else if (data.type === "timer_tick") {
                     timerDisplay.innerText = `⏳ ${data.time_left}s`;
                     const pct = (data.time_left / 60) * 100;
@@ -273,16 +290,53 @@ HTML_UI = """
                     wordBlanks.innerText = data.blanks;
                     addMessage(`Hint revealed: ${data.blanks}`, 'hint');
                 } else if (data.type === "lock_input") {
+                    hasSolvedCurrentRound = true;
                     guessInput.disabled = true;
                     guessInput.placeholder = "You solved it! Waiting for round to finish...";
                 } else if (data.type === "leaderboard") {
                     renderLeaderboard(data.roster);
-                } else if (data.type === "round_end") {
+                } else if (data.type === "intermission") {
                     wordBlanks.innerText = data.revealed_word.toUpperCase();
-                    timerDisplay.innerText = "⏳ 0s";
+                    timerDisplay.innerText = `⏳ ${data.countdown}s`;
                     progressBar.style.width = "0%";
                     guessInput.disabled = true;
-                    addMessage(`Round over! The secret word was '${data.revealed_word}'.`, 'round-end-banner');
+                    if (data.countdown === 5) {
+                        addMessage(`Word was '${data.revealed_word}'. Next round starting in 5s...`, 'intermission-line');
+                    }
+                } else if (data.type === "pause_state") {
+                    isPaused = data.paused;
+                    if (isPaused) {
+                        pauseBtn.innerText = "▶ Resume";
+                        pauseBtn.className = "start-btn";
+                        roundTag.innerText = "PAUSED";
+                        guessInput.disabled = true;
+                        guessInput.placeholder = "⏸ Match is paused by host...";
+                        addMessage("Match has been paused.", "pause-banner");
+                    } else {
+                        pauseBtn.innerText = "⏸ Pause";
+                        pauseBtn.className = "pause-btn";
+                        roundTag.innerText = `ROUND ${data.round}`;
+                        if (!hasSolvedCurrentRound) {
+                            guessInput.disabled = false;
+                            guessInput.placeholder = "Type your guess here...";
+                            guessInput.focus();
+                        }
+                        addMessage("Match resumed!", "system");
+                    }
+                } else if (data.type === "match_state") {
+                    matchRunning = data.running;
+                    if (matchRunning) {
+                        startBtn.style.display = "none";
+                        pauseBtn.style.display = "inline-block";
+                        stopBtn.style.display = "inline-block";
+                    } else {
+                        startBtn.style.display = "inline-block";
+                        pauseBtn.style.display = "none";
+                        stopBtn.style.display = "none";
+                        roundTag.innerText = "LOBBY";
+                        guessInput.disabled = true;
+                        guessInput.placeholder = "Match ended. Click Start Game to begin.";
+                    }
                 }
             };
         }
@@ -315,24 +369,31 @@ HTML_UI = """
         }
 
         function sendGuess() {
-            if (guessInput.value.trim() && !guessInput.disabled) {
+            if (guessInput.value.trim() && !guessInput.disabled && !isPaused) {
                 ws.send(JSON.stringify({ type: "guess", text: guessInput.value.trim() }));
                 guessInput.value = "";
             }
         }
 
-        function startRandom() {
-            const drawer = document.getElementById("drawer-select").value;
-            fetch(`/start?random_pick=true&drawer=${encodeURIComponent(drawer)}`);
+        function startMatch() {
+            fetch(`/match/start`);
         }
 
-        function startCustom() {
-            const val = document.getElementById("custom-word").value.trim();
-            if (val) {
-                const drawer = document.getElementById("drawer-select").value;
-                fetch(`/start?word=${encodeURIComponent(val)}&drawer=${encodeURIComponent(drawer)}`);
-                document.getElementById("custom-word").value = "";
+        function togglePause() {
+            if (!isPaused) {
+                fetch(`/match/pause`);
+            } else {
+                fetch(`/match/resume`);
             }
+        }
+
+        function stopMatch() {
+            fetch(`/match/stop`);
+        }
+
+        function updateDrawer() {
+            const d = document.getElementById("drawer-select").value;
+            fetch(`/drawer/set?model=${encodeURIComponent(d)}`);
         }
     </script>
 </body>
@@ -340,7 +401,7 @@ HTML_UI = """
 """
 
 @app.get("/")
-def get_ui():
+async def get_ui():
     return HTMLResponse(HTML_UI)
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -359,11 +420,25 @@ async def websocket_endpoint(websocket: WebSocket):
             if event_type == "register":
                 raw_name = data.get("name", "Player").strip()
                 connected_players[websocket]["name"] = raw_name[:16] if raw_name else "Player"
+                
                 await broadcast({"type": "leaderboard", "roster": get_leaderboard_payload()})
+                await websocket.send_json({"type": "match_state", "running": game_state["match_running"]})
+
+                # Instant state synchronization for mid-round arrivals
+                if game_state["is_round_active"]:
+                    blanks = build_hint_pattern(game_state["word"], game_state["revealed_indices"])
+                    await websocket.send_json({
+                        "type": "midway_sync",
+                        "round": game_state["round_num"],
+                        "length": len(game_state["word"]),
+                        "blanks": blanks,
+                        "svg": game_state["current_svg"],
+                        "can_guess": game_state["can_guess"],
+                        "is_paused": game_state["is_paused"]
+                    })
 
             elif event_type == "guess":
-                # Strict input gating: drop all guesses before strokes start
-                if not game_state["is_running"] or not game_state["can_guess"]:
+                if not game_state["is_round_active"] or not game_state["can_guess"] or game_state["is_paused"]:
                     continue
 
                 player = connected_players.get(websocket)
@@ -386,10 +461,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     await broadcast({"type": "leaderboard", "roster": get_leaderboard_payload()})
 
-                    # If all players (human + AI) have finished, complete the round immediately
                     all_humans_done = all(p["solved"] for p in connected_players.values())
                     if all_humans_done and game_state["ai_solved"]:
-                        game_state["is_running"] = False
+                        game_state["is_round_active"] = False
                 elif is_close_guess(guess, target):
                     await websocket.send_json({
                         "type": "chat",
@@ -397,7 +471,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         "text": f"'{guess}' is very close!"
                     })
                 else:
-                    # Echo guess publicly with the player's name
                     for client_ws, info in connected_players.items():
                         sender_class = "human" if client_ws == websocket else "peer"
                         await client_ws.send_json({
@@ -456,24 +529,77 @@ def get_candidate_words(word: str, revealed_indices: set[int]) -> list[str]:
     random.shuffle(candidates)
     return candidates[:8]
 
-@app.get("/start")
-async def start_game_round(word: str = None, random_pick: bool = False, drawer: str = DEFAULT_DRAWER):
-    if game_state["is_running"]:
-        return {"status": "A round is already running."}
-    
-    target_word = random.choice(WORD_BANK) if random_pick or not word else word.strip().lower()
-    game_state["drawer"] = drawer
-    asyncio.create_task(run_game_loop(target_word, drawer))
-    return {"status": "started", "word_length": len(target_word)}
+# --- ASYNC API ENDPOINTS ---
 
-async def run_game_loop(secret_word: str, drawer_model: str):
+@app.get("/drawer/set")
+async def set_drawer(model: str):
+    game_state["drawer"] = model
+    return {"status": "drawer updated", "drawer": model}
+
+@app.get("/match/start")
+async def start_match():
+    if not game_state["match_running"]:
+        game_state["match_running"] = True
+        game_state["is_paused"] = False
+        asyncio.create_task(run_continuous_match_loop())
+    return {"status": "match started"}
+
+@app.get("/match/pause")
+async def pause_match():
+    if game_state["match_running"]:
+        game_state["is_paused"] = True
+        await broadcast({"type": "pause_state", "paused": True, "round": game_state["round_num"]})
+    return {"status": "paused"}
+
+@app.get("/match/resume")
+async def resume_match():
+    if game_state["match_running"]:
+        game_state["is_paused"] = False
+        await broadcast({"type": "pause_state", "paused": False, "round": game_state["round_num"]})
+    return {"status": "resumed"}
+
+@app.get("/match/stop")
+async def stop_match():
+    game_state["match_running"] = False
+    game_state["is_paused"] = False
+    game_state["is_round_active"] = False
+    await broadcast({"type": "match_state", "running": False})
+    return {"status": "match stopping"}
+
+async def run_continuous_match_loop():
+    await broadcast({"type": "match_state", "running": True})
+
+    while game_state["match_running"]:
+        target_word = random.choice(WORD_BANK)
+        await run_single_round(target_word, game_state["drawer"])
+
+        if not game_state["match_running"]:
+            break
+
+        # 5-second intermission
+        for count in range(5, 0, -1):
+            while game_state["is_paused"] and game_state["match_running"]:
+                await asyncio.sleep(0.5)
+            if not game_state["match_running"]:
+                break
+            await broadcast({
+                "type": "intermission",
+                "countdown": count,
+                "revealed_word": target_word
+            })
+            await asyncio.sleep(1.0)
+
+    await broadcast({"type": "match_state", "running": False})
+
+async def run_single_round(secret_word: str, drawer_model: str):
     game_state["word"] = secret_word
-    game_state["is_running"] = True
+    game_state["is_round_active"] = True
     game_state["can_guess"] = False
     game_state["round_num"] += 1
     game_state["ai_solved"] = False
     game_state["revealed_indices"] = set()
     game_state["time_left"] = 60
+    game_state["current_svg"] = ""
 
     for p in connected_players.values():
         p["solved"] = False
@@ -481,7 +607,6 @@ async def run_game_loop(secret_word: str, drawer_model: str):
     attempted_ai_guesses = set()
     blanks = build_hint_pattern(secret_word, game_state["revealed_indices"])
 
-    # 1. Lock input and broadcast preparation state
     await broadcast({
         "type": "prep_round",
         "round": game_state["round_num"],
@@ -523,65 +648,80 @@ RULES FOR '{secret_word}':
     num_strokes = len(strokes)
 
     if not strokes:
-        await broadcast({"type": "round_end", "revealed_word": secret_word})
-        await broadcast({"type": "chat", "sender": "system", "text": "Drawer failed to generate recognizable shapes."})
-        game_state["is_running"] = False
+        await broadcast({"type": "chat", "sender": "system", "text": "Drawer failed to generate shapes."})
+        game_state["is_round_active"] = False
         return
 
-    # Timeline calculation: 46s window for strokes
     DRAWING_WINDOW = 46.0
     stroke_schedule = [int(i * (DRAWING_WINDOW / num_strokes)) for i in range(num_strokes)]
 
     total_time = 60
-    current_svg_body = ""
-    stroke_idx = 0
+    stroke_idx = 1
+    game_state["current_svg"] = f"\n{strokes[0]}"
     strokes_finished_announced = False
 
-    # 2. Emit the first stroke and unlock guessing simultaneously
-    current_svg_body += f"\n{strokes[0]}"
-    stroke_idx = 1
-    await broadcast({"type": "stroke_update", "svg": current_svg_body})
+    await broadcast({"type": "stroke_update", "svg": game_state["current_svg"]})
     game_state["can_guess"] = True
     await broadcast({"type": "round_active"})
 
+    word_len = len(secret_word)
+
     for second_left in range(total_time, 0, -1):
-        if not game_state["is_running"]:
+        if not game_state["is_round_active"] or not game_state["match_running"]:
+            break
+
+        # Live pause gate
+        while game_state["is_paused"] and game_state["match_running"]:
+            await asyncio.sleep(0.5)
+
+        if not game_state["is_round_active"] or not game_state["match_running"]:
             break
 
         elapsed = total_time - second_left
         game_state["time_left"] = second_left
         await broadcast({"type": "timer_tick", "time_left": second_left})
 
-        # Reveal 1st letter hint at 40s
-        if second_left == 40 and len(secret_word) > 3 and 0 not in game_state["revealed_indices"]:
+        # Adaptive Hints (Supports 3-letter words)
+        if word_len == 3 and second_left == 35 and len(game_state["revealed_indices"]) == 0:
             game_state["revealed_indices"].add(0)
             await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
-
-        # Reveal 2nd letter hint at 20s
-        if second_left == 20 and len(secret_word) > 4:
-            avail = [i for i in range(1, len(secret_word)) if i not in game_state["revealed_indices"]]
-            if avail:
-                game_state["revealed_indices"].add(random.choice(avail))
+        elif word_len in (4, 5):
+            if second_left == 40 and len(game_state["revealed_indices"]) == 0:
+                game_state["revealed_indices"].add(0)
                 await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
+            elif second_left == 20 and len(game_state["revealed_indices"]) == 1:
+                avail = [i for i in range(1, word_len) if i not in game_state["revealed_indices"]]
+                if avail:
+                    game_state["revealed_indices"].add(random.choice(avail))
+                    await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
+        elif word_len >= 6:
+            if second_left == 45 and len(game_state["revealed_indices"]) == 0:
+                game_state["revealed_indices"].add(0)
+                await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
+            elif second_left == 25 and len(game_state["revealed_indices"]) == 1:
+                avail = [i for i in range(1, word_len) if i not in game_state["revealed_indices"]]
+                if avail:
+                    game_state["revealed_indices"].add(random.choice(avail))
+                    await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
 
-        # Timeline emission
+        # Progressive stroke emission
         while stroke_idx < num_strokes and elapsed >= stroke_schedule[stroke_idx]:
-            current_svg_body += f"\n{strokes[stroke_idx]}"
-            await broadcast({"type": "stroke_update", "svg": current_svg_body})
+            game_state["current_svg"] += f"\n{strokes[stroke_idx]}"
+            await broadcast({"type": "stroke_update", "svg": game_state["current_svg"]})
             stroke_idx += 1
             if stroke_idx == num_strokes and not strokes_finished_announced:
                 strokes_finished_announced = True
                 await broadcast({"type": "chat", "sender": "system", "text": "🎨 Sketch complete! Keep guessing until time runs out!"})
 
-        # Guesser attempts prediction every 4 seconds
-        if not game_state["ai_solved"] and elapsed % 4 == 0 and current_svg_body:
+        # Guesser prediction cycle every 4 seconds
+        if not game_state["ai_solved"] and elapsed % 4 == 0 and game_state["current_svg"]:
             full_svg = f"""<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">
                 <style>
                     * {{ stroke-linecap: round; stroke-linejoin: round; }}
                     rect.canvas-bg {{ fill: white !important; stroke: none !important; }}
                 </style>
                 <rect class="canvas-bg" width="300" height="300"/>
-                {current_svg_body}
+                {game_state['current_svg']}
             </svg>"""
 
             png_bytes = cairosvg.svg2png(bytestring=full_svg.encode("utf-8"), output_width=300, output_height=300)
@@ -623,7 +763,7 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
 
                     all_humans_done = all(p["solved"] for p in connected_players.values())
                     if all_humans_done:
-                        game_state["is_running"] = False
+                        game_state["is_round_active"] = False
                 else:
                     if ai_guess not in attempted_ai_guesses:
                         attempted_ai_guesses.add(ai_guess)
@@ -635,10 +775,8 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
 
         await asyncio.sleep(1.0)
 
-    # 3. Round wrap-up
-    game_state["is_running"] = False
+    game_state["is_round_active"] = False
     game_state["can_guess"] = False
-    await broadcast({"type": "round_end", "revealed_word": secret_word})
 
 if __name__ == "__main__":
     import uvicorn
