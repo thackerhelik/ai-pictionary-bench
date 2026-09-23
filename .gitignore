@@ -1,0 +1,16 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Generated test artifacts (optional: keep or ignore)
+*.png
+*.svg
+
+# Environment & OS files
+.env
+.DS_Store
