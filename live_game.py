@@ -13,8 +13,6 @@ app = FastAPI()
 DEFAULT_DRAWER = "gemma4:e4b"
 GUESSER_MODEL = "qwen2.5vl:3b"
 
-COLOR_PALETTE = ["#3b82f6", "#ef4444", "#10b981", "#f59e0b", "#8b5cf6", "#06b6d4"]
-
 WORD_BANK = [
     "apple", "clock", "house", "car", "guitar", "bicycle", "airplane",
     "candle", "cactus", "chair", "umbrella", "bridge", "robot", "spider",
@@ -148,7 +146,7 @@ HTML_UI = """
         <div id="canvas-container">
             <svg id="live-svg" viewBox="0 0 300 300" width="360" height="360" xmlns="http://www.w3.org/2000/svg">
                 <style>
-                    * { fill: none !important; stroke-width: 4px !important; stroke-linecap: round; stroke-linejoin: round; }
+                    * { stroke-linecap: round; stroke-linejoin: round; }
                     rect.canvas-bg { fill: #ffffff !important; stroke: none !important; }
                 </style>
                 <rect class="canvas-bg" width="300" height="300"/>
@@ -194,7 +192,7 @@ HTML_UI = """
         const roundCounter = document.getElementById("round-counter");
 
         const svgFrame = `<style>
-            * { fill: none !important; stroke-width: 4px !important; stroke-linecap: round; stroke-linejoin: round; }
+            * { stroke-linecap: round; stroke-linejoin: round; }
             rect.canvas-bg { fill: #ffffff !important; stroke: none !important; }
         </style><rect class="canvas-bg" width="300" height="300"/>`;
 
@@ -295,7 +293,6 @@ async def broadcast(message: dict):
         await conn.send_json(message)
 
 def calculate_score(time_left: int, hints_revealed_count: int) -> int:
-    """Timer-based scoring with penalty per revealed hint."""
     score = (time_left * 10) - (hints_revealed_count * 100)
     return max(50, score)
 
@@ -314,7 +311,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if guess == target:
-                    # Correct guess: compute points, do NOT expose secret word in chat
                     game_state["human_guessed"] = True
                     pts = calculate_score(game_state["time_left"], len(game_state["revealed_indices"]))
                     game_state["human_score"] += pts
@@ -331,46 +327,48 @@ async def websocket_endpoint(websocket: WebSocket):
                         "ai_score": game_state["ai_score"]
                     })
 
-                    # If AI also already guessed, terminate round immediately
                     if game_state["ai_guessed"]:
                         game_state["is_running"] = False
                 elif is_close_guess(guess, target):
-                    # Near miss fuzzy warning
                     await broadcast({
                         "type": "chat",
                         "sender": "close",
                         "text": f"'{guess}' is very close!"
                     })
                 else:
-                    # Normal incorrect guess visible to all
                     await broadcast({"type": "chat", "sender": "human", "text": f"You guessed: {guess}"})
 
     except WebSocketDisconnect:
         active_connections.remove(websocket)
 
-def parse_and_colorize_strokes(raw_svg: str) -> list[str]:
+def sanitize_and_parse_strokes(raw_svg: str) -> list[str]:
+    """Extracts SVG shapes while preserving intentional color fills and default wireframes."""
     svg_block = re.search(r"<svg[\s\S]*?<\/svg>", raw_svg, re.IGNORECASE)
     content = svg_block.group(0) if svg_block else raw_svg
 
-    # Forgiving pattern matching both self-closing and unclosed tags
     stroke_pattern = r"(<(path|circle|rect|line|ellipse|polyline|polygon)\b[^>]*?(?:\/?>|>[\s\S]*?<\/\2>))"
     matches = [m[0] for m in re.findall(stroke_pattern, content, re.IGNORECASE)]
     
     clean = []
-    for idx, s in enumerate(matches):
+    for s in matches:
         if 'width="300"' in s and 'height="300"' in s:
             continue
         
-        # Ensure tag is properly closed for cairosvg
+        # Ensure tag closes cleanly
         if not s.endswith("/>") and not re.search(r"<\/\w+>$", s):
             s = s.rstrip(">") + "/>"
 
-        # Apply colorful stroke from palette if missing or monochrome
-        chosen_color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
+        # 1. Fill handling: Allow color fills, but convert missing/black fills to none
+        if "fill=" not in s.lower():
+            s = s.replace("/>", ' fill="none"/>', 1)
+        else:
+            s = re.sub(r'fill=["\']?(black|#000000|#000|#111111)["\']?', 'fill="none"', s, flags=re.IGNORECASE)
+
+        # 2. Stroke handling: If stroke is missing, default to neutral dark slate
         if "stroke=" not in s.lower():
-            s = s.replace("/>", f' stroke="{chosen_color}"/>', 1)
-        elif re.search(r'stroke=["\']?(black|#000|#111|#222|#333|gray)["\']?', s, re.IGNORECASE):
-            s = re.sub(r'stroke=["\']?[^"\'>\s]+["\']?', f'stroke="{chosen_color}"', s)
+            s = s.replace("/>", ' stroke="#334155" stroke-width="4"/>', 1)
+        elif "stroke-width=" not in s.lower():
+            s = s.replace("/>", ' stroke-width="4"/>', 1)
 
         clean.append(s)
     return clean
@@ -423,27 +421,27 @@ async def run_game_loop(secret_word: str, drawer_model: str):
     })
     await broadcast({"type": "chat", "sender": "system", "text": f"[{drawer_model}] is sketching..."})
 
-    # Restored few-shot prompt with explicit scale & orientation
-    prompt = f"""You are playing Pictionary. Draw a clear, recognizable SVG outline sketch of: '{secret_word}'.
+    # Generalized drawing prompt with semantic coloring and higher stroke budget
+    prompt = f"""You are playing Pictionary. Draw a clear, detailed, multi-element vector sketch of: '{secret_word}'.
 Canvas: 300x300. Center is (150, 150).
 
 FEW-SHOT EXAMPLE:
 <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">
-  <circle cx="150" cy="140" r="50" stroke="#10b981" stroke-width="4" fill="none"/>
-  <line x1="150" y1="190" x2="150" y2="260" stroke="#8b5cf6" stroke-width="6"/>
+  <rect x="110" y="140" width="80" height="20" rx="4" fill="#d97706" stroke="#92400e" stroke-width="4"/>
+  <rect x="115" y="165" width="10" height="60" fill="#92400e" stroke="#78350f" stroke-width="3"/>
+  <rect x="175" y="165" width="10" height="60" fill="#92400e" stroke="#78350f" stroke-width="3"/>
+  <rect x="115" y="70" width="10" height="70" fill="#b45309" stroke="#78350f" stroke-width="3"/>
+  <rect x="125" y="80" width="60" height="15" fill="#fef3c7" stroke="#92400e" stroke-width="3"/>
 </svg>
 
-SPATIAL ORIENTATION RULES:
-- For HORIZONTAL or VEHICLE objects (bicycle, car, airplane, boat, glasses):
-  Spread components left-to-right along the X-axis (e.g. wheels at cx="80" and cx="220").
-- For VERTICAL objects (tree, candle, snowman, sword, ladder):
-  Stack components along the Y-axis.
-
 RULES FOR '{secret_word}':
-1. Output 4 to 8 distinct geometric shapes (circle, line, rect, path).
-2. Canvas scale: main structure 80-140px centered around (150, 150).
-3. Use stroke colors (e.g. stroke="#3b82f6", stroke="#ef4444", stroke="#10b981").
-4. Every shape MUST have fill="none" and stroke-width="4".
+1. THEMATIC COLORING: Pick a cohesive, natural color palette fitting '{secret_word}' (e.g. browns/wood tones for furniture, green/brown for plants, warm reds/yellows for food/sun, dark metallics for tools/vehicles).
+2. COLOR FILL TOOL: Use BOTH outline strokes (stroke="...") and colored fills (fill="...") to give shapes real volume and color.
+3. EXTENDED DETAIL (8 to 14 shapes): Draw the complete object piece-by-piece:
+   - Primary structure & surfaces (seats, cushions, frames, bodies)
+   - Supporting elements (all legs, wheels, handles, struts)
+   - Defining accents (slats, textures, details)
+4. Do NOT stop after 2 or 3 strokes. Output 8 to 14 distinct elements.
 5. Return ONLY the raw <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">...</svg> block."""
 
     loop = asyncio.get_event_loop()
@@ -451,14 +449,13 @@ RULES FOR '{secret_word}':
         None, lambda: ollama.chat(
             model=drawer_model,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.25}
+            options={"temperature": 0.3}
         )
     )
 
     msg = response.get('message', {})
     svg_content = msg.get('content', '').strip()
     
-    # Fallback if reasoning tokens were placed in thinking buffer
     if not svg_content and 'thinking' in msg:
         svg_content = msg['thinking'].strip()
 
@@ -467,7 +464,7 @@ RULES FOR '{secret_word}':
     print(svg_content if svg_content else f"<EMPTY> | Done: {response.get('done_reason')} | Count: {response.get('eval_count')}")
     print(f"==========================================")
 
-    strokes = parse_and_colorize_strokes(svg_content)
+    strokes = sanitize_and_parse_strokes(svg_content)
     print(f"[DEBUG Drawer Parsed]: Extracted {len(strokes)} valid strokes from {drawer_model}\n")
 
     if not strokes:
@@ -502,8 +499,8 @@ RULES FOR '{secret_word}':
                 game_state["revealed_indices"].add(random.choice(avail))
                 await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
 
-        # Progressive stroke reveals
-        if stroke_idx < num_strokes and (total_time - second_left) % 3 == 0:
+        # Progressive stroke reveals (reveals 1 stroke every 2 seconds)
+        if stroke_idx < num_strokes and (total_time - second_left) % 2 == 0:
             current_svg_body += f"\n{strokes[stroke_idx]}"
             await broadcast({"type": "stroke_update", "svg": current_svg_body})
             stroke_idx += 1
@@ -511,11 +508,11 @@ RULES FOR '{secret_word}':
                 strokes_finished_announced = True
                 await broadcast({"type": "chat", "sender": "system", "text": "🎨 Sketch complete! Keep guessing until time runs out!"})
 
-        # Guesser attempts prediction every 4 seconds (if AI has not already guessed)
+        # Guesser attempts prediction every 4 seconds
         if not game_state["ai_guessed"] and (total_time - second_left) % 4 == 0 and current_svg_body:
             full_svg = f"""<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">
                 <style>
-                    * {{ fill: none !important; stroke-width: 4px !important; stroke-linecap: round; stroke-linejoin: round; }}
+                    * {{ stroke-linecap: round; stroke-linejoin: round; }}
                     rect.canvas-bg {{ fill: white !important; stroke: none !important; }}
                 </style>
                 <rect class="canvas-bg" width="300" height="300"/>
@@ -549,7 +546,6 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
 
             if matches_pattern(ai_guess, secret_word, game_state["revealed_indices"]):
                 if ai_guess == secret_word.lower():
-                    # AI guessed correctly: award points and conceal word
                     game_state["ai_guessed"] = True
                     pts = calculate_score(second_left, len(game_state["revealed_indices"]))
                     game_state["ai_score"] += pts
@@ -566,7 +562,6 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
                         "ai_score": game_state["ai_score"]
                     })
 
-                    # If Human also solved, round is complete
                     if game_state["human_guessed"]:
                         game_state["is_running"] = False
                 else:
