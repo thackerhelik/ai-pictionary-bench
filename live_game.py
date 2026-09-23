@@ -20,13 +20,12 @@ WORD_BANK = [
     "banana", "sun", "flower", "bottle", "glasses", "scissors"
 ]
 
-# Player Registry: { ws: {"name": str, "score": int, "solved": bool} }
 connected_players: dict[WebSocket, dict] = {}
 
 game_state = {
-    "match_running": False,    # True while match is active
-    "is_paused": False,        # True while host has paused the match
-    "is_round_active": False,  # True while an individual round is running
+    "match_running": False,
+    "is_paused": False,
+    "is_round_active": False,
     "word": "",
     "drawer": DEFAULT_DRAWER,
     "can_guess": False,
@@ -35,8 +34,27 @@ game_state = {
     "ai_solved": False,
     "revealed_indices": set(),
     "time_left": 60,
-    "current_svg": ""          # Preserved for instant midway join sync
+    "current_svg": ""
 }
+
+# --- TERMINAL LOGGING UTILITIES ---
+def print_section(title: str, char="="):
+    print(f"\n{char * 65}\n  {title}\n{char * 65}")
+
+def extract_thinking_and_content(response: dict) -> tuple[str, str]:
+    """Separates reasoning/thinking tokens from content across all Ollama models."""
+    msg = response.get('message', {})
+    content = msg.get('content', '') or ''
+    thinking = msg.get('thinking', '') or ''
+
+    # Handle inline <think> tags
+    if '<think>' in content:
+        match = re.search(r'<think>([\s\S]*?)(?:<\/think>|$)', content)
+        if match:
+            thinking = match.group(1).strip()
+            content = re.sub(r'<think>[\s\S]*?<\/think>', '', content).strip()
+
+    return thinking.strip(), content.strip()
 
 def levenshtein_distance(s1: str, s2: str) -> int:
     if len(s1) < len(s2):
@@ -105,20 +123,20 @@ HTML_UI = """
         .modal-box { background: #111827; border: 1px solid #1e293b; border-radius: 12px; padding: 24px; width: 320px; text-align: center; }
         .modal-box input { width: 90%; padding: 10px; margin: 15px 0; border-radius: 6px; border: 1px solid #334155; background: #0b0f19; color: #fff; font-size: 15px; text-align: center; }
 
-        #canvas-panel { flex: 2; display: flex; flex-direction: column; align-items: center; justify-content: center; border-right: 1px solid #1e293b; padding: 20px; }
+        #canvas-panel { flex: 2; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; border-right: 1px solid #1e293b; padding: 15px; overflow-y: auto; }
         #chat-panel { flex: 1; display: flex; flex-direction: column; background: #070a10; }
         
-        #game-header { width: 380px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 6px; }
+        #game-header { width: 380px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 6px; }
         .status-row { display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 15px; }
         #timer-display { font-variant-numeric: tabular-nums; font-size: 18px; color: #38bdf8; }
         #word-blanks { font-family: monospace; font-size: 22px; letter-spacing: 5px; color: #fbbf24; font-weight: bold; }
         #progress-container { width: 100%; height: 6px; background: #1e293b; border-radius: 3px; overflow: hidden; }
         #progress-bar { width: 100%; height: 100%; background: #38bdf8; transition: width 1s linear, background-color 0.5s; }
 
-        #leaderboard-card { width: 380px; background: #111827; border: 1px solid #1e293b; border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+        #leaderboard-card { width: 380px; background: #111827; border: 1px solid #1e293b; border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
         .lb-header { background: #1e293b; padding: 6px 12px; font-size: 12px; font-weight: 700; color: #94a3b8; display: flex; justify-content: space-between; }
-        .lb-list { display: flex; flex-direction: column; max-height: 110px; overflow-y: auto; }
-        .lb-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; border-bottom: 1px solid #1e293b; font-size: 13px; }
+        .lb-list { display: flex; flex-direction: column; max-height: 90px; overflow-y: auto; }
+        .lb-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 12px; border-bottom: 1px solid #1e293b; font-size: 13px; }
         .lb-name { display: flex; align-items: center; gap: 6px; font-weight: 600; }
         .badge-solved { color: #86efac; font-size: 12px; font-weight: bold; }
 
@@ -140,13 +158,21 @@ HTML_UI = """
         #guess-input { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid #334155; background: #111827; color: #fff; font-size: 14px; outline: none; }
         #guess-input:disabled { background: #182030; color: #64748b; cursor: not-allowed; }
         
-        #controls { margin-top: 15px; display: flex; gap: 8px; width: 380px; justify-content: center; align-items: center; }
+        #controls { margin-top: 10px; display: flex; gap: 8px; width: 380px; justify-content: center; align-items: center; }
         select { padding: 8px 10px; border-radius: 6px; border: 1px solid #334155; background: #111827; color: #fff; font-size: 13px; }
-        button { padding: 8px 14px; border-radius: 6px; border: none; color: #fff; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+        button { padding: 8px 12px; border-radius: 6px; border: none; color: #fff; font-weight: 600; cursor: pointer; transition: opacity 0.15s; font-size: 13px; }
         button:hover { opacity: 0.9; }
         button.start-btn { background: #059669; }
         button.pause-btn { background: #d97706; }
         button.stop-btn { background: #dc2626; }
+        button.inspector-btn { background: #475569; }
+
+        /* Collapsible Inspector Drawer */
+        #inspector-container { width: 380px; margin-top: 10px; display: none; flex-direction: column; background: #050811; border: 1px solid #1e293b; border-radius: 8px; font-family: monospace; font-size: 11px; }
+        .insp-tab-header { display: flex; background: #0d1322; border-bottom: 1px solid #1e293b; }
+        .insp-tab { flex: 1; padding: 6px; text-align: center; cursor: pointer; color: #94a3b8; font-weight: bold; }
+        .insp-tab.active { background: #1e293b; color: #38bdf8; }
+        .insp-body { padding: 8px; max-height: 180px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; color: #cbd5e1; }
     </style>
 </head>
 <body>
@@ -191,12 +217,22 @@ HTML_UI = """
         <div id="controls">
             <button id="start-btn" class="start-btn" onclick="startMatch()">▶ Start Game</button>
             <button id="pause-btn" class="pause-btn" style="display:none;" onclick="togglePause()">⏸ Pause</button>
-            <button id="stop-btn" class="stop-btn" style="display:none;" onclick="stopMatch()">⏹ End Match</button>
+            <button id="stop-btn" class="stop-btn" style="display:none;" onclick="stopMatch()">⏹ End</button>
+            <button class="inspector-btn" onclick="toggleInspector()">🔬 Inspector</button>
             <select id="drawer-select" onchange="updateDrawer()">
                 <option value="gemma4:e4b">Drawer: gemma4:e4b</option>
                 <option value="qwen3.5:2b">Drawer: qwen3.5:2b</option>
                 <option value="qwen2.5:3b">Drawer: qwen2.5:3b</option>
             </select>
+        </div>
+
+        <div id="inspector-container">
+            <div class="insp-tab-header">
+                <div class="insp-tab active" id="tab-btn-drawer" onclick="switchInspTab('drawer')">🧠 Drawer Thought & SVG</div>
+                <div class="insp-tab" id="tab-btn-guesser" onclick="switchInspTab('guesser')">👁️ Guesser Evaluation</div>
+            </div>
+            <div class="insp-body" id="insp-content-drawer">Awaiting drawer output...</div>
+            <div class="insp-body" id="insp-content-guesser" style="display:none;">Awaiting guesser cycles...</div>
         </div>
     </div>
 
@@ -227,6 +263,10 @@ HTML_UI = """
         const pauseBtn = document.getElementById("pause-btn");
         const stopBtn = document.getElementById("stop-btn");
 
+        const inspContainer = document.getElementById("inspector-container");
+        const inspDrawer = document.getElementById("insp-content-drawer");
+        const inspGuesser = document.getElementById("insp-content-guesser");
+
         const svgFrame = `<style>
             * { stroke-linecap: round; stroke-linejoin: round; }
             rect.canvas-bg { fill: #ffffff !important; stroke: none !important; }
@@ -238,6 +278,24 @@ HTML_UI = """
             myName = val;
             document.getElementById("name-modal").style.display = "none";
             initWebSocket();
+        }
+
+        function toggleInspector() {
+            inspContainer.style.display = (inspContainer.style.display === "flex") ? "none" : "flex";
+        }
+
+        function switchInspTab(tab) {
+            if (tab === 'drawer') {
+                document.getElementById("tab-btn-drawer").className = "insp-tab active";
+                document.getElementById("tab-btn-guesser").className = "insp-tab";
+                inspDrawer.style.display = "block";
+                inspGuesser.style.display = "none";
+            } else {
+                document.getElementById("tab-btn-drawer").className = "insp-tab";
+                document.getElementById("tab-btn-guesser").className = "insp-tab active";
+                inspDrawer.style.display = "none";
+                inspGuesser.style.display = "block";
+            }
         }
 
         function initWebSocket() {
@@ -263,6 +321,8 @@ HTML_UI = """
                     guessInput.disabled = true;
                     guessInput.placeholder = "🎨 Drawer is sketching... Locked!";
                     addMessage(`--- Round ${data.round} Started! Object has ${data.length} letters. ---`, 'system');
+                    inspDrawer.innerText = "Generating drawing plan...";
+                    inspGuesser.innerText = "No guesses yet this round.";
                 } else if (data.type === "round_active") {
                     if (!isPaused && !hasSolvedCurrentRound) {
                         guessInput.disabled = false;
@@ -295,6 +355,14 @@ HTML_UI = """
                     guessInput.placeholder = "You solved it! Waiting for round to finish...";
                 } else if (data.type === "leaderboard") {
                     renderLeaderboard(data.roster);
+                } else if (data.type === "inspector_log") {
+                    if (data.channel === "drawer") {
+                        inspDrawer.innerText = `=== MODEL: ${data.model} ===\\n[THINKING]:\\n${data.thinking || '(None / Direct generation)'}\\n\\n[RAW SVG]:\\n${data.raw}\\n\\n[EXTRACTED STROKES]: ${data.stroke_count}`;
+                    } else if (data.channel === "guesser") {
+                        const prev = inspGuesser.innerText === "No guesses yet this round." ? "" : inspGuesser.innerText + "\\n\\n";
+                        inspGuesser.innerText = prev + `[t=${data.time}s | Hint: ${data.pattern}]\\nCandidates: ${data.candidates}\\nThinking: ${data.thinking || '(None)'}\\nRaw Guess: '${data.raw_guess}' -> Sanitized: '${data.clean_guess}'\\nVerdict: ${data.verdict}`;
+                        inspGuesser.scrollTop = inspGuesser.scrollHeight;
+                    }
                 } else if (data.type === "intermission") {
                     wordBlanks.innerText = data.revealed_word.toUpperCase();
                     timerDisplay.innerText = `⏳ ${data.countdown}s`;
@@ -424,7 +492,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 await broadcast({"type": "leaderboard", "roster": get_leaderboard_payload()})
                 await websocket.send_json({"type": "match_state", "running": game_state["match_running"]})
 
-                # Instant state synchronization for mid-round arrivals
                 if game_state["is_round_active"]:
                     blanks = build_hint_pattern(game_state["word"], game_state["revealed_indices"])
                     await websocket.send_json({
@@ -529,11 +596,10 @@ def get_candidate_words(word: str, revealed_indices: set[int]) -> list[str]:
     random.shuffle(candidates)
     return candidates[:8]
 
-# --- ASYNC API ENDPOINTS ---
-
 @app.get("/drawer/set")
 async def set_drawer(model: str):
     game_state["drawer"] = model
+    print(f"\n[CONFIG] Drawer model changed to: {model}")
     return {"status": "drawer updated", "drawer": model}
 
 @app.get("/match/start")
@@ -548,6 +614,7 @@ async def start_match():
 async def pause_match():
     if game_state["match_running"]:
         game_state["is_paused"] = True
+        print(f"\n[MATCH PAUSED] Host paused Round {game_state['round_num']}")
         await broadcast({"type": "pause_state", "paused": True, "round": game_state["round_num"]})
     return {"status": "paused"}
 
@@ -555,6 +622,7 @@ async def pause_match():
 async def resume_match():
     if game_state["match_running"]:
         game_state["is_paused"] = False
+        print(f"\n[MATCH RESUMED] Host resumed Round {game_state['round_num']}")
         await broadcast({"type": "pause_state", "paused": False, "round": game_state["round_num"]})
     return {"status": "resumed"}
 
@@ -563,6 +631,7 @@ async def stop_match():
     game_state["match_running"] = False
     game_state["is_paused"] = False
     game_state["is_round_active"] = False
+    print(f"\n[MATCH STOPPED] Match ended by host.")
     await broadcast({"type": "match_state", "running": False})
     return {"status": "match stopping"}
 
@@ -607,6 +676,10 @@ async def run_single_round(secret_word: str, drawer_model: str):
     attempted_ai_guesses = set()
     blanks = build_hint_pattern(secret_word, game_state["revealed_indices"])
 
+    print_section(f"ROUND {game_state['round_num']} INITIATED | TARGET: '{secret_word.upper()}' ({len(secret_word)} letters)")
+    print(f"🎨 Drawer Model : {drawer_model}")
+    print(f"👁️ Guesser Model: {GUESSER_MODEL}")
+
     await broadcast({
         "type": "prep_round",
         "round": game_state["round_num"],
@@ -639,13 +712,30 @@ RULES FOR '{secret_word}':
         )
     )
 
-    msg = response.get('message', {})
-    svg_content = msg.get('content', '').strip()
-    if not svg_content and 'thinking' in msg:
-        svg_content = msg['thinking'].strip()
+    drawer_thinking, svg_content = extract_thinking_and_content(response)
+
+    # --- TERMINAL LOGGING: DRAWER OUTPUT ---
+    print("\n" + "-" * 50)
+    print(f"🧠 [DRAWER THINKING / REASONING ({drawer_model})]:")
+    print(drawer_thinking if drawer_thinking else "(No separate thinking output generated)")
+    print("-" * 50)
+    print(f"🎨 [DRAWER RAW SVG ({drawer_model})]:")
+    print(svg_content if svg_content else "(EMPTY CONTENT RETURNED)")
+    print("-" * 50)
 
     strokes = sanitize_and_parse_strokes(svg_content)
     num_strokes = len(strokes)
+    print(f"📦 [PARSED STROKES]: Extracted {num_strokes} valid geometric shapes\n")
+
+    # Broadcast to web UI inspector
+    await broadcast({
+        "type": "inspector_log",
+        "channel": "drawer",
+        "model": drawer_model,
+        "thinking": drawer_thinking,
+        "raw": svg_content,
+        "stroke_count": num_strokes
+    })
 
     if not strokes:
         await broadcast({"type": "chat", "sender": "system", "text": "Drawer failed to generate shapes."})
@@ -670,7 +760,6 @@ RULES FOR '{secret_word}':
         if not game_state["is_round_active"] or not game_state["match_running"]:
             break
 
-        # Live pause gate
         while game_state["is_paused"] and game_state["match_running"]:
             await asyncio.sleep(0.5)
 
@@ -681,39 +770,50 @@ RULES FOR '{secret_word}':
         game_state["time_left"] = second_left
         await broadcast({"type": "timer_tick", "time_left": second_left})
 
-        # Adaptive Hints (Supports 3-letter words)
+        # Adaptive hints
         if word_len == 3 and second_left == 35 and len(game_state["revealed_indices"]) == 0:
             game_state["revealed_indices"].add(0)
-            await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
+            pattern = build_hint_pattern(secret_word, game_state["revealed_indices"])
+            print(f"💡 [HINT REVEALED at t={second_left}s]: {pattern}")
+            await broadcast({"type": "hint_update", "blanks": pattern})
         elif word_len in (4, 5):
             if second_left == 40 and len(game_state["revealed_indices"]) == 0:
                 game_state["revealed_indices"].add(0)
-                await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
+                pattern = build_hint_pattern(secret_word, game_state["revealed_indices"])
+                print(f"💡 [HINT REVEALED at t={second_left}s]: {pattern}")
+                await broadcast({"type": "hint_update", "blanks": pattern})
             elif second_left == 20 and len(game_state["revealed_indices"]) == 1:
                 avail = [i for i in range(1, word_len) if i not in game_state["revealed_indices"]]
                 if avail:
                     game_state["revealed_indices"].add(random.choice(avail))
-                    await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
+                    pattern = build_hint_pattern(secret_word, game_state["revealed_indices"])
+                    print(f"💡 [HINT REVEALED at t={second_left}s]: {pattern}")
+                    await broadcast({"type": "hint_update", "blanks": pattern})
         elif word_len >= 6:
             if second_left == 45 and len(game_state["revealed_indices"]) == 0:
                 game_state["revealed_indices"].add(0)
-                await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
+                pattern = build_hint_pattern(secret_word, game_state["revealed_indices"])
+                print(f"💡 [HINT REVEALED at t={second_left}s]: {pattern}")
+                await broadcast({"type": "hint_update", "blanks": pattern})
             elif second_left == 25 and len(game_state["revealed_indices"]) == 1:
                 avail = [i for i in range(1, word_len) if i not in game_state["revealed_indices"]]
                 if avail:
                     game_state["revealed_indices"].add(random.choice(avail))
-                    await broadcast({"type": "hint_update", "blanks": build_hint_pattern(secret_word, game_state["revealed_indices"])})
+                    pattern = build_hint_pattern(secret_word, game_state["revealed_indices"])
+                    print(f"💡 [HINT REVEALED at t={second_left}s]: {pattern}")
+                    await broadcast({"type": "hint_update", "blanks": pattern})
 
-        # Progressive stroke emission
+        # Timeline emission
         while stroke_idx < num_strokes and elapsed >= stroke_schedule[stroke_idx]:
             game_state["current_svg"] += f"\n{strokes[stroke_idx]}"
             await broadcast({"type": "stroke_update", "svg": game_state["current_svg"]})
             stroke_idx += 1
             if stroke_idx == num_strokes and not strokes_finished_announced:
                 strokes_finished_announced = True
+                print("🎨 [DRAWER COMPLETED]: All planned strokes rendered.")
                 await broadcast({"type": "chat", "sender": "system", "text": "🎨 Sketch complete! Keep guessing until time runs out!"})
 
-        # Guesser prediction cycle every 4 seconds
+        # Guesser cycle every 4 seconds
         if not game_state["ai_solved"] and elapsed % 4 == 0 and game_state["current_svg"]:
             full_svg = f"""<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">
                 <style>
@@ -736,6 +836,8 @@ HINTS:
 - Options matching this pattern: [{candidate_str}]
 Choose the SINGLE word from the list that best matches the sketch. Answer with ONLY that single word."""
             else:
+                candidates = []
+                candidate_str = "None (Open-ended)"
                 guess_prompt = f"What simple object is sketched in this image? The word has {len(secret_word)} letters. Answer with ONLY the single lowercase noun."
 
             ai_resp = await loop.run_in_executor(
@@ -745,8 +847,40 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
                     options={"temperature": 0.2}
                 )
             )
-            raw_guess = ai_resp['message']['content']
-            ai_guess = re.sub(r"[^\w]", "", raw_guess).strip().lower()
+
+            guesser_thinking, raw_guess_content = extract_thinking_and_content(ai_resp)
+            ai_guess = re.sub(r"[^\w]", "", raw_guess_content).strip().lower()
+
+            # Determine verdict for logs
+            if matches_pattern(ai_guess, secret_word, game_state["revealed_indices"]):
+                if ai_guess == secret_word.lower():
+                    verdict = "✅ CORRECT! Won round points"
+                else:
+                    verdict = "❌ Valid pattern, but incorrect object"
+            else:
+                verdict = "⚠️ INVALID (Violates letter pattern or length)"
+
+            # Print Guesser Log to Terminal
+            print(f"👁️ [GUESSER CYCLE @ t={second_left}s]")
+            print(f"   Pattern     : {current_pattern}")
+            print(f"   Candidates  : [{candidate_str}]")
+            if guesser_thinking:
+                print(f"   Thinking    : {guesser_thinking}")
+            print(f"   Raw Output  : '{raw_guess_content}' -> Parsed: '{ai_guess}'")
+            print(f"   Verdict     : {verdict}")
+
+            # Send to web UI inspector
+            await broadcast({
+                "type": "inspector_log",
+                "channel": "guesser",
+                "time": second_left,
+                "pattern": current_pattern,
+                "candidates": candidate_str,
+                "thinking": guesser_thinking,
+                "raw_guess": raw_guess_content,
+                "clean_guess": ai_guess,
+                "verdict": verdict
+            })
 
             if matches_pattern(ai_guess, secret_word, game_state["revealed_indices"]):
                 if ai_guess == secret_word.lower():
