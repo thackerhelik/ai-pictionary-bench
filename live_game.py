@@ -51,6 +51,59 @@ game_state = {
     "current_svg": ""
 }
 
+MODEL_REGISTRY = {
+    # --- RWTH Inferenz NRW (Open Weights / Unlimited) ---
+    "rwth:gpt-oss-120b": {
+        "engine": "rwth",
+        "api_name": "gpt-oss-120b",
+        "max_completion_tokens": 3000,
+        "extra_body": {}
+    },
+    "rwth:mistralai-mistral-small-4-119b": {
+        "engine": "rwth",
+        "api_name": "mistralai-mistral-small-4-119b",
+        "max_completion_tokens": 3000,
+        "extra_body": {}
+    },
+    "rwth:Qwen 3.8 27B": {
+        "engine": "rwth",
+        "api_name": "Qwen 3.8 27B",
+        "max_completion_tokens": 3500,
+        "extra_body": {"reasoning_effort": "low"}
+    },
+
+    # --- RWTH Commercial Endpoints (Subject to Request Quotas) ---
+    "rwth:gpt-5.5": {
+        "engine": "rwth",
+        "api_name": "gpt-5.5",
+        "max_completion_tokens": 4000,
+        "extra_body": {"reasoning_effort": "low"}
+    },
+    "rwth:gpt-5.4-mini": {
+        "engine": "rwth",
+        "api_name": "gpt-5.4-mini",
+        "max_completion_tokens": 3000,
+        "extra_body": {"reasoning_effort": "low"}
+    },
+
+    # --- Local WSL Ollama Fallbacks ---
+    "gemma4:e4b": {
+        "engine": "ollama",
+        "api_name": "gemma4:e4b",
+        "temperature": 0.3
+    },
+    "qwen3.5:2b": {
+        "engine": "ollama",
+        "api_name": "qwen3.5:2b",
+        "temperature": 0.3
+    },
+    "qwen2.5:3b": {
+        "engine": "ollama",
+        "api_name": "qwen2.5:3b",
+        "temperature": 0.3
+    }
+}
+
 def print_section(title: str, char="="):
     print(f"\n{char * 65}\n  {title}\n{char * 65}")
 
@@ -732,42 +785,47 @@ async def run_single_round(secret_word: str, drawer_model: str):
     await broadcast({"type": "leaderboard", "roster": get_leaderboard_payload()})
     await broadcast({"type": "chat", "sender": "system", "text": f"[{drawer_model}] is sketching..."})
 
-    prompt = f"""You are playing Pictionary. Draw a highly detailed, progressive vector sketch of: '{secret_word}'.
+    prompt = f"""You are playing Pictionary. Draw a progressive vector sketch of: '{secret_word}'.
 Canvas: 300x300. Center is (150, 150).
 
-DRAW IN 3 CHRONOLOGICAL PHASES (Output 12 to 16 total shapes):
-- Phase 1 (Base & Background): Primary silhouette, background contours, ground lines, or large fills.
-- Phase 2 (Surfaces & Colors): Main body volume, fills, branches, cushions, or rims.
-- Phase 3 (Fine Details & Foreground): Spines/needles, wheels, buttons, texture lines, or toppings.
-CRITICAL: Draw from background to foreground so later shapes do not cover earlier ones!
+DRAW IN 3 PHASES (Output 12 to 16 total shapes):
+- Phase 1 (Base & Backdrop): Silhouette contours, ground shadows, or foundational shapes.
+- Phase 2 (Surfaces & Colors): Main body volume and primary colored fills.
+- Phase 3 (Fine Details & Foreground): Highlights, secondary accents, or markings.
 
-RULES FOR '{secret_word}':
+SVG RULES:
 1. Output 12 to 16 distinct geometric elements (<rect>, <circle>, <ellipse>, <path>, <line>).
-2. Choose realistic colors matching '{secret_word}'. Use fill="..." for solid parts and stroke="..." for outlines.
-3. Every shape must have stroke-width="3" or "4".
-4. OUTPUT FORMAT:
-   - First, inside <plan>...</plan>, briefly plan the layers, coordinates, and colors in 2 to 4 bullet points.
-   - Then, output the raw <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">...</svg> block.
-   - Do NOT include any markdown commentary, greetings, or explanations outside these blocks."""
+2. Write elements in order: background shapes first, body middle, details last.
+3. Realistic colors matching '{secret_word}'. Use fill="..." for solid parts and stroke="..." with stroke-width="3" or "4".
+4. Any filled <path> should be closed (end with 'Z').
+5. Every shape must add new visual information.
+
+OUTPUT FORMAT:
+- First, inside <plan>...</plan>, write 2 to 4 concise bullet points outlining the layers and colors (1 sentence each).
+- Then, output the raw <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">...</svg> block.
+- Do NOT include any commentary outside these blocks."""
 
     drawer_thinking = ""
     svg_content = ""
 
+    # Look up profile, falling back to a safe default if unknown
+    profile = MODEL_REGISTRY.get(drawer_model, {
+        "engine": "rwth" if drawer_model.startswith("rwth:") else "ollama",
+        "api_name": drawer_model.replace("rwth:", ""),
+        "max_completion_tokens": 3000,
+        "extra_body": {"reasoning_effort": "low"}
+    })
+
     try:
-        if drawer_model.startswith("rwth:"):
-            actual_model_name = drawer_model.replace("rwth:", "")
-            
-            # Configure request parameters
+        if profile["engine"] == "rwth":
             api_kwargs = {
-                "model": actual_model_name,
+                "model": profile["api_name"],
                 "messages": [{"role": "user", "content": prompt}],
-                "max_completion_tokens": 4000,  # Raised from 1500 to prevent token exhaustion
+                "max_completion_tokens": profile.get("max_completion_tokens", 3000),
                 "timeout": 90.0
             }
-
-            # For GPT-5 models, keep reasoning light so it starts drawing immediately
-            if "gpt-5" in actual_model_name:
-                api_kwargs["extra_body"] = {"reasoning_effort": "low"}
+            if profile.get("extra_body"):
+                api_kwargs["extra_body"] = profile["extra_body"]
 
             api_res = await rwth_client.chat.completions.create(**api_kwargs)
             choice = api_res.choices[0]
@@ -775,27 +833,30 @@ RULES FOR '{secret_word}':
             finish_reason = getattr(choice, "finish_reason", "")
             thinking_text = getattr(choice.message, "reasoning_content", "") or ""
 
-            # If the model exhausted tokens during reasoning, trigger the fallback
+            # Detect token budget exhaustion before SVG was reached
             if finish_reason == "length" and not raw_text:
-                raise RuntimeError(f"{actual_model_name} exhausted all tokens during reasoning before outputting SVG.")
+                raise RuntimeError(f"{drawer_model} exhausted all completion tokens during reasoning.")
 
-            plan_match = re.search(r"<plan>([\s\S]*?)<\/plan>", raw_text, re.IGNORECASE)
-            if plan_match:
-                thinking_text = plan_match.group(1).strip()
-                raw_text = re.sub(r"<plan>[\s\S]*?<\/plan>", "", raw_text, flags=re.IGNORECASE).strip()
-            elif "<think>" in raw_text:
-                think_match = re.search(r"<think>([\s\S]*?)<\/think>", raw_text, re.IGNORECASE)
-                if think_match:
-                    thinking_text = think_match.group(1).strip()
-                    raw_text = re.sub(r"<think>[\s\S]*?<\/think>", "", raw_text, flags=re.IGNORECASE).strip()
+            # Isolate <plan> or <think> tags into thinking_text
+            for tag in ("plan", "think"):
+                match = re.search(rf"<{tag}>([\s\S]*?)<\/{tag}>", raw_text, re.IGNORECASE)
+                if match:
+                    thinking_text = match.group(1).strip()
+                    raw_text = re.sub(rf"<{tag}>[\s\S]*?<\/{tag}>", "", raw_text, flags=re.IGNORECASE).strip()
+                    break
 
-            drawer_thinking, svg_content = thinking_text.strip(), raw_text.strip()
+            drawer_thinking = thinking_text.strip()
+            svg_content = raw_text.strip()
+
         else:
             response = await asyncio.to_thread(
                 ollama.chat,
-                model=drawer_model,
+                model=profile["api_name"],
                 messages=[{"role": "user", "content": prompt}],
-                options={"temperature": 0.3}
+                options={
+                    "temperature": profile.get("temperature", 0.3),
+                    "num_predict": 4096  # Raised from default so thinking doesn't starve the SVG
+                }
             )
             drawer_thinking, svg_content = extract_thinking_and_content(response)
 
@@ -817,7 +878,10 @@ RULES FOR '{secret_word}':
                     ollama.chat,
                     model="gemma4:e4b",
                     messages=[{"role": "user", "content": prompt}],
-                    options={"temperature": 0.3}
+                    options={
+                        "temperature": profile.get("temperature", 0.3),
+                        "num_predict": 4096  # Prevents truncation if the model thinks extensively
+                    }
                 )
                 drawer_thinking, svg_content = extract_thinking_and_content(response)
                 
