@@ -14,3 +14,10 @@ __pycache__/
 # Environment & OS files
 .env
 .DS_Store
+
+# Windows artifacts
+Thumbs.db
+ehthumbs.db
+
+# If you downloaded Cloudflared installer inside the project folder
+*.deb
