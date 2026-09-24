@@ -21,3 +21,5 @@ ehthumbs.db
 
 # If you downloaded Cloudflared installer inside the project folder
 *.deb
+
+models.json

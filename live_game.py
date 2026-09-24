@@ -17,12 +17,13 @@ RWTH_API_KEY = os.getenv("RWTH_API_KEY", "")
 rwth_client = AsyncOpenAI(
     base_url="https://chat.kiconnect.nrw/api/v1",
     api_key=RWTH_API_KEY if RWTH_API_KEY else "dummy-key",
-    timeout=30.0
+    timeout=90.0,
+    max_retries=2
 )
 
 app = FastAPI()
 
-DEFAULT_DRAWER = "gemma4:e4b"
+DEFAULT_DRAWER = "rwth:gpt-oss-120b"
 GUESSER_MODEL = "qwen2.5vl:3b"
 
 WORD_BANK = [
@@ -229,11 +230,19 @@ HTML_UI = """
             <button id="stop-btn" class="stop-btn" style="display:none;" onclick="stopMatch()">⏹ End</button>
             <button class="inspector-btn" onclick="toggleInspector()">🔬 Inspector</button>
             <select id="drawer-select" onchange="updateDrawer()">
-                <option value="gemma4:e4b" selected>Local: gemma4:e4b</option>
-                <option value="rwth:gpt-oss-120b">RWTH: gpt-oss-120b (120B Remote)</option>
+                <!-- RWTH High-Capacity Cloud Models -->
+                <option value="rwth:gpt-oss-120b" selected>RWTH: gpt-oss-120b (120B Remote)</option>
                 <option value="rwth:mistralai-mistral-small-4-119b">RWTH: Mistral Small (119B Remote)</option>
-                <option value="qwen3.5:2b">Local: qwen3.5:2b</option>
-                <option value="qwen2.5:3b">Local: qwen2.5:3b</option>
+                <option value="rwth:Qwen 3.8 27B">RWTH: Qwen 3.8 27B (Vision + Reasoning)</option>
+
+                <!-- Commercial Cloud Fallbacks (Uses Quota) -->
+                <option value="rwth:gpt-5.5">RWTH: GPT-5.5 (Flagship)</option>
+                <option value="rwth:gpt-5.4-mini">RWTH: GPT-5.4 Mini</option>
+                
+                <!-- Local WSL Ollama Fallbacks -->
+                <option value="gemma4:e4b">Local: gemma4:e4b (4B)</option>
+                <option value="qwen3.5:2b">Local: qwen3.5:2b (2B)</option>
+                <option value="qwen2.5:3b">Local: qwen2.5:3b (3B)</option>
             </select>
         </div>
 
@@ -327,7 +336,8 @@ HTML_UI = """
                 } else if (data.type === "chat") {
                     addMessage(data.text, data.sender);
                 } else if (data.type === "prep_round") {
-                    hasSolvedCurrentRound = false;
+                    isPaused = false;               // 1. Resets pause state so input unlocks on stroke 1
+                    hasSolvedCurrentRound = false;  // 2. Resets solve status for the new round
                     wordBlanks.innerText = data.blanks;
                     svgContainer.innerHTML = svgFrame;
                     messages.innerHTML = '';
@@ -335,8 +345,8 @@ HTML_UI = """
                     guessInput.disabled = true;
                     guessInput.placeholder = "🎨 Drawer is sketching... Locked!";
                     addMessage(`--- Round ${data.round} Started! Object has ${data.length} letters. ---`, 'system');
-                    inspDrawer.innerText = "Generating drawing plan...";
-                    inspGuesser.innerText = "No guesses yet this round.";
+                    inspDrawer.innerText = "Generating drawing plan...";     // 3. Clears old drawing plan
+                    inspGuesser.innerText = "No guesses yet this round.";   // 4. Clears old guess evaluation logs
                 } else if (data.type === "round_active") {
                     if (!isPaused && !hasSolvedCurrentRound) {
                         guessInput.disabled = false;
@@ -458,7 +468,7 @@ HTML_UI = """
         }
 
         function startMatch() {
-            // Read the active dropdown selection and pass it directly to /match/start
+            isPaused = false;  // Reset pause state on new match
             const activeDrawer = document.getElementById("drawer-select").value;
             fetch(`/match/start?drawer=${encodeURIComponent(activeDrawer)}`);
         }
@@ -472,6 +482,7 @@ HTML_UI = """
         }
 
         function stopMatch() {
+            isPaused = false;  // Reset pause state on stop
             fetch(`/match/stop`);
         }
 
@@ -734,19 +745,50 @@ RULES FOR '{secret_word}':
 1. Output 12 to 16 distinct geometric elements (<rect>, <circle>, <ellipse>, <path>, <line>).
 2. Choose realistic colors matching '{secret_word}'. Use fill="..." for solid parts and stroke="..." for outlines.
 3. Every shape must have stroke-width="3" or "4".
-4. Return ONLY the raw <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">...</svg> block. No text."""
+4. OUTPUT FORMAT:
+   - First, inside <plan>...</plan>, briefly plan the layers, coordinates, and colors in 2 to 4 bullet points.
+   - Then, output the raw <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">...</svg> block.
+   - Do NOT include any markdown commentary, greetings, or explanations outside these blocks."""
+
+    drawer_thinking = ""
+    svg_content = ""
 
     try:
         if drawer_model.startswith("rwth:"):
             actual_model_name = drawer_model.replace("rwth:", "")
-            api_res = await rwth_client.chat.completions.create(
-                model=actual_model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3
-            )
-            msg_obj = api_res.choices[0].message
-            raw_text = msg_obj.content or ""
-            thinking_text = getattr(msg_obj, "reasoning_content", "") or ""
+            
+            # Configure request parameters
+            api_kwargs = {
+                "model": actual_model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_completion_tokens": 4000,  # Raised from 1500 to prevent token exhaustion
+                "timeout": 90.0
+            }
+
+            # For GPT-5 models, keep reasoning light so it starts drawing immediately
+            if "gpt-5" in actual_model_name:
+                api_kwargs["extra_body"] = {"reasoning_effort": "low"}
+
+            api_res = await rwth_client.chat.completions.create(**api_kwargs)
+            choice = api_res.choices[0]
+            raw_text = choice.message.content or ""
+            finish_reason = getattr(choice, "finish_reason", "")
+            thinking_text = getattr(choice.message, "reasoning_content", "") or ""
+
+            # If the model exhausted tokens during reasoning, trigger the fallback
+            if finish_reason == "length" and not raw_text:
+                raise RuntimeError(f"{actual_model_name} exhausted all tokens during reasoning before outputting SVG.")
+
+            plan_match = re.search(r"<plan>([\s\S]*?)<\/plan>", raw_text, re.IGNORECASE)
+            if plan_match:
+                thinking_text = plan_match.group(1).strip()
+                raw_text = re.sub(r"<plan>[\s\S]*?<\/plan>", "", raw_text, flags=re.IGNORECASE).strip()
+            elif "<think>" in raw_text:
+                think_match = re.search(r"<think>([\s\S]*?)<\/think>", raw_text, re.IGNORECASE)
+                if think_match:
+                    thinking_text = think_match.group(1).strip()
+                    raw_text = re.sub(r"<think>[\s\S]*?<\/think>", "", raw_text, flags=re.IGNORECASE).strip()
+
             drawer_thinking, svg_content = thinking_text.strip(), raw_text.strip()
         else:
             response = await asyncio.to_thread(
@@ -756,12 +798,41 @@ RULES FOR '{secret_word}':
                 options={"temperature": 0.3}
             )
             drawer_thinking, svg_content = extract_thinking_and_content(response)
+
     except Exception as e:
         err_msg = f"Drawer ({drawer_model}) failed: {str(e)}"
         print(f"❌ [DRAWER ERROR]: {err_msg}")
-        await broadcast({"type": "chat", "sender": "ai-warn", "text": f"Error with {drawer_model}. Check console/key."})
-        game_state["is_round_active"] = False
-        return
+
+        # If a cloud model timed out or threw an API error, fall back to offline local model
+        if drawer_model.startswith("rwth:"):
+            reason = "timed out" if "timeout" in str(e).lower() else "API error"
+            print(f"⚠️ [FALLBACK]: Falling back to local gemma4:e4b ({reason}).")
+            await broadcast({
+                "type": "chat",
+                "sender": "ai-warn",
+                "text": f"RWTH model {reason}. Falling back to local gemma4:e4b..."
+            })
+            try:
+                response = await asyncio.to_thread(
+                    ollama.chat,
+                    model="gemma4:e4b",
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"temperature": 0.3}
+                )
+                drawer_thinking, svg_content = extract_thinking_and_content(response)
+                
+                # UPDATE THE ACTIVE MODEL NAME HERE:
+                drawer_model = "gemma4:e4b (fallback)"
+
+            except Exception as local_err:
+                print(f"❌ [LOCAL FALLBACK ERROR]: {local_err}")
+                await broadcast({"type": "chat", "sender": "system", "text": "Drawer failed to generate shapes."})
+                game_state["is_round_active"] = False
+                return
+        else:
+            await broadcast({"type": "chat", "sender": "system", "text": "Drawer failed to generate shapes."})
+            game_state["is_round_active"] = False
+            return
 
     # Check if round was cancelled while waiting on model inference
     if not game_state["match_running"] or game_state["round_num"] != current_round_id:
@@ -875,7 +946,13 @@ RULES FOR '{secret_word}':
                 {game_state['current_svg']}
             </svg>"""
 
-            png_bytes = cairosvg.svg2png(bytestring=full_svg.encode("utf-8"), output_width=300, output_height=300)
+            # png_bytes = cairosvg.svg2png(bytestring=full_svg.encode("utf-8"), output_width=300, output_height=300)
+            png_bytes = await asyncio.to_thread(
+                cairosvg.svg2png,
+                bytestring=full_svg.encode("utf-8"),
+                output_width=300,
+                output_height=300
+            )
             current_pattern = build_hint_pattern(secret_word, game_state["revealed_indices"])
 
             if game_state["revealed_indices"]:
