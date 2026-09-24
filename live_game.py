@@ -1,12 +1,24 @@
 import asyncio
 import io
+import os
 import random
 import re
 import time
 import cairosvg
 import ollama
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.responses import HTMLResponse
+from openai import AsyncOpenAI
+
+load_dotenv()
+
+RWTH_API_KEY = os.getenv("RWTH_API_KEY", "")
+rwth_client = AsyncOpenAI(
+    base_url="https://chat.kiconnect.nrw/api/v1",
+    api_key=RWTH_API_KEY if RWTH_API_KEY else "dummy-key",
+    timeout=30.0
+)
 
 app = FastAPI()
 
@@ -26,6 +38,7 @@ game_state = {
     "match_running": False,
     "is_paused": False,
     "is_round_active": False,
+    "active_task": None,       # Stores active asyncio.Task to prevent ghost loops
     "word": "",
     "drawer": DEFAULT_DRAWER,
     "can_guess": False,
@@ -37,17 +50,14 @@ game_state = {
     "current_svg": ""
 }
 
-# --- TERMINAL LOGGING UTILITIES ---
 def print_section(title: str, char="="):
     print(f"\n{char * 65}\n  {title}\n{char * 65}")
 
 def extract_thinking_and_content(response: dict) -> tuple[str, str]:
-    """Separates reasoning/thinking tokens from content across all Ollama models."""
     msg = response.get('message', {})
     content = msg.get('content', '') or ''
     thinking = msg.get('thinking', '') or ''
 
-    # Handle inline <think> tags
     if '<think>' in content:
         match = re.search(r'<think>([\s\S]*?)(?:<\/think>|$)', content)
         if match:
@@ -167,7 +177,6 @@ HTML_UI = """
         button.stop-btn { background: #dc2626; }
         button.inspector-btn { background: #475569; }
 
-        /* Collapsible Inspector Drawer */
         #inspector-container { width: 380px; margin-top: 10px; display: none; flex-direction: column; background: #050811; border: 1px solid #1e293b; border-radius: 8px; font-family: monospace; font-size: 11px; }
         .insp-tab-header { display: flex; background: #0d1322; border-bottom: 1px solid #1e293b; }
         .insp-tab { flex: 1; padding: 6px; text-align: center; cursor: pointer; color: #94a3b8; font-weight: bold; }
@@ -220,9 +229,11 @@ HTML_UI = """
             <button id="stop-btn" class="stop-btn" style="display:none;" onclick="stopMatch()">⏹ End</button>
             <button class="inspector-btn" onclick="toggleInspector()">🔬 Inspector</button>
             <select id="drawer-select" onchange="updateDrawer()">
-                <option value="gemma4:e4b">Drawer: gemma4:e4b</option>
-                <option value="qwen3.5:2b">Drawer: qwen3.5:2b</option>
-                <option value="qwen2.5:3b">Drawer: qwen2.5:3b</option>
+                <option value="gemma4:e4b" selected>Local: gemma4:e4b</option>
+                <option value="rwth:gpt-oss-120b">RWTH: gpt-oss-120b (120B Remote)</option>
+                <option value="rwth:mistralai-mistral-small-4-119b">RWTH: Mistral Small (119B Remote)</option>
+                <option value="qwen3.5:2b">Local: qwen3.5:2b</option>
+                <option value="qwen2.5:3b">Local: qwen2.5:3b</option>
             </select>
         </div>
 
@@ -278,6 +289,8 @@ HTML_UI = """
             myName = val;
             document.getElementById("name-modal").style.display = "none";
             initWebSocket();
+            // Sync whatever model is currently showing in the dropdown immediately
+            updateDrawer();
         }
 
         function toggleInspector() {
@@ -317,6 +330,7 @@ HTML_UI = """
                     hasSolvedCurrentRound = false;
                     wordBlanks.innerText = data.blanks;
                     svgContainer.innerHTML = svgFrame;
+                    messages.innerHTML = '';
                     roundTag.innerText = `ROUND ${data.round}`;
                     guessInput.disabled = true;
                     guessInput.placeholder = "🎨 Drawer is sketching... Locked!";
@@ -444,7 +458,9 @@ HTML_UI = """
         }
 
         function startMatch() {
-            fetch(`/match/start`);
+            // Read the active dropdown selection and pass it directly to /match/start
+            const activeDrawer = document.getElementById("drawer-select").value;
+            fetch(`/match/start?drawer=${encodeURIComponent(activeDrawer)}`);
         }
 
         function togglePause() {
@@ -513,7 +529,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 guess = data.get("text", "").strip().lower()
-                target = game_state["word"].lower()
+                target = game_state["word"].strip().lower()
 
                 if guess == target:
                     player["solved"] = True
@@ -603,12 +619,22 @@ async def set_drawer(model: str):
     return {"status": "drawer updated", "drawer": model}
 
 @app.get("/match/start")
-async def start_match():
-    if not game_state["match_running"]:
-        game_state["match_running"] = True
-        game_state["is_paused"] = False
-        asyncio.create_task(run_continuous_match_loop())
-    return {"status": "match started"}
+async def start_match(drawer: str = None):
+    if drawer:
+        game_state["drawer"] = drawer
+        print(f"\n[CONFIG] Match starting with drawer: {drawer}")
+
+    if game_state["active_task"] and not game_state["active_task"].done():
+        game_state["active_task"].cancel()
+        try:
+            await game_state["active_task"]
+        except asyncio.CancelledError:
+            pass
+
+    game_state["match_running"] = True
+    game_state["is_paused"] = False
+    game_state["active_task"] = asyncio.create_task(run_continuous_match_loop())
+    return {"status": "match started", "drawer": game_state["drawer"]}
 
 @app.get("/match/pause")
 async def pause_match():
@@ -631,6 +657,8 @@ async def stop_match():
     game_state["match_running"] = False
     game_state["is_paused"] = False
     game_state["is_round_active"] = False
+    if game_state["active_task"] and not game_state["active_task"].done():
+        game_state["active_task"].cancel()
     print(f"\n[MATCH STOPPED] Match ended by host.")
     await broadcast({"type": "match_state", "running": False})
     return {"status": "match stopping"}
@@ -638,33 +666,37 @@ async def stop_match():
 async def run_continuous_match_loop():
     await broadcast({"type": "match_state", "running": True})
 
-    while game_state["match_running"]:
-        target_word = random.choice(WORD_BANK)
-        await run_single_round(target_word, game_state["drawer"])
+    try:
+        while game_state["match_running"]:
+            target_word = random.choice(WORD_BANK)
+            await run_single_round(target_word, game_state["drawer"])
 
-        if not game_state["match_running"]:
-            break
-
-        # 5-second intermission
-        for count in range(5, 0, -1):
-            while game_state["is_paused"] and game_state["match_running"]:
-                await asyncio.sleep(0.5)
             if not game_state["match_running"]:
                 break
-            await broadcast({
-                "type": "intermission",
-                "countdown": count,
-                "revealed_word": target_word
-            })
-            await asyncio.sleep(1.0)
 
-    await broadcast({"type": "match_state", "running": False})
+            # 5-second intermission
+            for count in range(5, 0, -1):
+                while game_state["is_paused"] and game_state["match_running"]:
+                    await asyncio.sleep(0.5)
+                if not game_state["match_running"]:
+                    break
+                await broadcast({
+                    "type": "intermission",
+                    "countdown": count,
+                    "revealed_word": target_word
+                })
+                await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        print("\n[MATCH LOOP CANCELLED CLEANLY]")
+    finally:
+        await broadcast({"type": "match_state", "running": False})
 
 async def run_single_round(secret_word: str, drawer_model: str):
+    current_round_id = game_state["round_num"] + 1
+    game_state["round_num"] = current_round_id
     game_state["word"] = secret_word
     game_state["is_round_active"] = True
     game_state["can_guess"] = False
-    game_state["round_num"] += 1
     game_state["ai_solved"] = False
     game_state["revealed_indices"] = set()
     game_state["time_left"] = 60
@@ -676,13 +708,13 @@ async def run_single_round(secret_word: str, drawer_model: str):
     attempted_ai_guesses = set()
     blanks = build_hint_pattern(secret_word, game_state["revealed_indices"])
 
-    print_section(f"ROUND {game_state['round_num']} INITIATED | TARGET: '{secret_word.upper()}' ({len(secret_word)} letters)")
+    print_section(f"ROUND {current_round_id} INITIATED | TARGET: '{secret_word.upper()}' ({len(secret_word)} letters)")
     print(f"🎨 Drawer Model : {drawer_model}")
     print(f"👁️ Guesser Model: {GUESSER_MODEL}")
 
     await broadcast({
         "type": "prep_round",
-        "round": game_state["round_num"],
+        "round": current_round_id,
         "length": len(secret_word),
         "blanks": blanks
     })
@@ -693,9 +725,10 @@ async def run_single_round(secret_word: str, drawer_model: str):
 Canvas: 300x300. Center is (150, 150).
 
 DRAW IN 3 CHRONOLOGICAL PHASES (Output 12 to 16 total shapes):
-- Phase 1 (Base & Foundation): Main silhouette, ground, or primary outline.
+- Phase 1 (Base & Background): Primary silhouette, background contours, ground lines, or large fills.
 - Phase 2 (Surfaces & Colors): Main body volume, fills, branches, cushions, or rims.
-- Phase 3 (Fine Details & Context): Spines/needles, wheels, buttons, texture lines, or background cues.
+- Phase 3 (Fine Details & Foreground): Spines/needles, wheels, buttons, texture lines, or toppings.
+CRITICAL: Draw from background to foreground so later shapes do not cover earlier ones!
 
 RULES FOR '{secret_word}':
 1. Output 12 to 16 distinct geometric elements (<rect>, <circle>, <ellipse>, <path>, <line>).
@@ -703,18 +736,37 @@ RULES FOR '{secret_word}':
 3. Every shape must have stroke-width="3" or "4".
 4. Return ONLY the raw <svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">...</svg> block. No text."""
 
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None, lambda: ollama.chat(
-            model=drawer_model,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.3}
-        )
-    )
+    try:
+        if drawer_model.startswith("rwth:"):
+            actual_model_name = drawer_model.replace("rwth:", "")
+            api_res = await rwth_client.chat.completions.create(
+                model=actual_model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3
+            )
+            msg_obj = api_res.choices[0].message
+            raw_text = msg_obj.content or ""
+            thinking_text = getattr(msg_obj, "reasoning_content", "") or ""
+            drawer_thinking, svg_content = thinking_text.strip(), raw_text.strip()
+        else:
+            response = await asyncio.to_thread(
+                ollama.chat,
+                model=drawer_model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.3}
+            )
+            drawer_thinking, svg_content = extract_thinking_and_content(response)
+    except Exception as e:
+        err_msg = f"Drawer ({drawer_model}) failed: {str(e)}"
+        print(f"❌ [DRAWER ERROR]: {err_msg}")
+        await broadcast({"type": "chat", "sender": "ai-warn", "text": f"Error with {drawer_model}. Check console/key."})
+        game_state["is_round_active"] = False
+        return
 
-    drawer_thinking, svg_content = extract_thinking_and_content(response)
+    # Check if round was cancelled while waiting on model inference
+    if not game_state["match_running"] or game_state["round_num"] != current_round_id:
+        return
 
-    # --- TERMINAL LOGGING: DRAWER OUTPUT ---
     print("\n" + "-" * 50)
     print(f"🧠 [DRAWER THINKING / REASONING ({drawer_model})]:")
     print(drawer_thinking if drawer_thinking else "(No separate thinking output generated)")
@@ -727,7 +779,6 @@ RULES FOR '{secret_word}':
     num_strokes = len(strokes)
     print(f"📦 [PARSED STROKES]: Extracted {num_strokes} valid geometric shapes\n")
 
-    # Broadcast to web UI inspector
     await broadcast({
         "type": "inspector_log",
         "channel": "drawer",
@@ -757,13 +808,13 @@ RULES FOR '{secret_word}':
     word_len = len(secret_word)
 
     for second_left in range(total_time, 0, -1):
-        if not game_state["is_round_active"] or not game_state["match_running"]:
+        if not game_state["is_round_active"] or not game_state["match_running"] or game_state["round_num"] != current_round_id:
             break
 
         while game_state["is_paused"] and game_state["match_running"]:
             await asyncio.sleep(0.5)
 
-        if not game_state["is_round_active"] or not game_state["match_running"]:
+        if not game_state["is_round_active"] or not game_state["match_running"] or game_state["round_num"] != current_round_id:
             break
 
         elapsed = total_time - second_left
@@ -803,7 +854,7 @@ RULES FOR '{secret_word}':
                     print(f"💡 [HINT REVEALED at t={second_left}s]: {pattern}")
                     await broadcast({"type": "hint_update", "blanks": pattern})
 
-        # Timeline emission
+        # Progressive stroke emission
         while stroke_idx < num_strokes and elapsed >= stroke_schedule[stroke_idx]:
             game_state["current_svg"] += f"\n{strokes[stroke_idx]}"
             await broadcast({"type": "stroke_update", "svg": game_state["current_svg"]})
@@ -813,7 +864,7 @@ RULES FOR '{secret_word}':
                 print("🎨 [DRAWER COMPLETED]: All planned strokes rendered.")
                 await broadcast({"type": "chat", "sender": "system", "text": "🎨 Sketch complete! Keep guessing until time runs out!"})
 
-        # Guesser cycle every 4 seconds
+        # Guesser prediction cycle every 4 seconds
         if not game_state["ai_solved"] and elapsed % 4 == 0 and game_state["current_svg"]:
             full_svg = f"""<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg">
                 <style>
@@ -840,18 +891,16 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
                 candidate_str = "None (Open-ended)"
                 guess_prompt = f"What simple object is sketched in this image? The word has {len(secret_word)} letters. Answer with ONLY the single lowercase noun."
 
-            ai_resp = await loop.run_in_executor(
-                None, lambda: ollama.chat(
-                    model=GUESSER_MODEL,
-                    messages=[{"role": "user", "content": guess_prompt, "images": [png_bytes]}],
-                    options={"temperature": 0.2}
-                )
+            ai_resp = await asyncio.to_thread(
+                ollama.chat,
+                model=GUESSER_MODEL,
+                messages=[{"role": "user", "content": guess_prompt, "images": [png_bytes]}],
+                options={"temperature": 0.2}
             )
 
             guesser_thinking, raw_guess_content = extract_thinking_and_content(ai_resp)
             ai_guess = re.sub(r"[^\w]", "", raw_guess_content).strip().lower()
 
-            # Determine verdict for logs
             if matches_pattern(ai_guess, secret_word, game_state["revealed_indices"]):
                 if ai_guess == secret_word.lower():
                     verdict = "✅ CORRECT! Won round points"
@@ -860,7 +909,6 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
             else:
                 verdict = "⚠️ INVALID (Violates letter pattern or length)"
 
-            # Print Guesser Log to Terminal
             print(f"👁️ [GUESSER CYCLE @ t={second_left}s]")
             print(f"   Pattern     : {current_pattern}")
             print(f"   Candidates  : [{candidate_str}]")
@@ -869,7 +917,6 @@ Choose the SINGLE word from the list that best matches the sketch. Answer with O
             print(f"   Raw Output  : '{raw_guess_content}' -> Parsed: '{ai_guess}'")
             print(f"   Verdict     : {verdict}")
 
-            # Send to web UI inspector
             await broadcast({
                 "type": "inspector_log",
                 "channel": "guesser",
